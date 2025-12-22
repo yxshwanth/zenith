@@ -331,6 +331,51 @@ HLC ensures consistent ordering across all CockroachDB nodes:
 
 This means that zookies from different nodes can be compared and ordered consistently.
 
+#### Visualizing HLC Clock Skew Resolution
+
+The following diagram illustrates how Hybrid Logical Clocks handle clock skew across distributed nodes:
+
+```mermaid
+graph TB
+    subgraph Node1["Node 1<br/>Physical Clock: 1000ms"]
+        E1[Event A<br/>Physical: 1000<br/>Logical: 0<br/>HLC: 1000.0]
+        E2[Event B<br/>Physical: 1001<br/>Logical: 0<br/>HLC: 1001.0]
+    end
+    
+    subgraph Node2["Node 2<br/>Physical Clock: 998ms<br/>(2ms behind)"]
+        E3[Event C<br/>Physical: 998<br/>Logical: 1<br/>HLC: 998.1]
+        E4[Event D<br/>Physical: 999<br/>Logical: 1<br/>HLC: 999.1]
+    end
+    
+    subgraph Node3["Node 3<br/>Physical Clock: 1002ms<br/>(2ms ahead)"]
+        E5[Event E<br/>Physical: 1002<br/>Logical: 0<br/>HLC: 1002.0]
+    end
+    
+    E1 -->|"HLC ensures ordering"| E3
+    E3 -->|"Logical counter increments<br/>when physical time lags"| E4
+    E4 -->|"Causal ordering preserved"| E2
+    E2 -->|"All nodes see consistent order"| E5
+```
+
+**Key Insights:**
+
+1. **Physical Clock Skew**: Node 2's physical clock is 2ms behind Node 1, and Node 3 is 2ms ahead. Without HLC, events might be ordered incorrectly.
+
+2. **Logical Counter Compensation**: When Node 2 generates Event C at physical time 998ms (which is less than Node 1's 1000ms), HLC increments the logical counter to 1, creating HLC timestamp 998.1. This ensures 998.1 > 1000.0 is false, preserving causal ordering.
+
+3. **Consistent Ordering**: Despite physical clock differences, all nodes see events in the same causal order:
+   - Event A (1000.0) happens before Event C (998.1) if A causally precedes C
+   - Event D (999.1) happens before Event B (1001.0) if D causally precedes B
+   - Event E (1002.0) happens after all previous events
+
+4. **No Global Clock Required**: HLC achieves consistent ordering without requiring perfect clock synchronization, making it practical for distributed systems.
+
+**Example Scenario:**
+- Node 1 writes tuple at HLC 1000.0
+- Node 2 reads with zookie 1000.0, but its physical clock shows 998ms
+- HLC ensures Node 2's read sees the write because 998.1 < 1000.0 (logical counter ensures ordering)
+- Result: Causal consistency maintained despite 2ms clock skew
+
 ### Complete Example Flow
 
 Here's a complete example of how Zookies flow through the system:
@@ -663,6 +708,44 @@ Logical timestamps (HLC) are faster than alternatives:
 - **TrueTime (Spanner)**: Requires atomic clocks, GPS, complex synchronization
 - **HLC (CockroachDB)**: Simple local algorithm, no special hardware
 
+### Formal Latency Model
+
+The total latency of a check operation in Zenith can be formally modeled as:
+
+$$L_{check} = L_{network} + L_{cache} + \sum_{i=1}^{d} (L_{db\_query} \cdot P_{miss})$$
+
+Where:
+- $L_{check}$ = Total latency of a check operation
+- $L_{network}$ = Network latency (gRPC request/response overhead)
+- $L_{cache}$ = Cache lookup latency (typically <1ms for LRU cache)
+- $d$ = Expansion depth (number of recursive levels in userset expansion)
+- $L_{db\_query}$ = Database query latency per level (typically 5-10ms)
+- $P_{miss}$ = Probability of cache miss at depth $i$
+
+**Key Insights:**
+
+1. **Base Latency**: $L_{network} + L_{cache}$ represents the fixed overhead of every check operation, typically 1-2ms.
+
+2. **Recursive Cost**: The summation term $\sum_{i=1}^{d} (L_{db\_query} \cdot P_{miss})$ captures the recursive nature of ReBAC systems:
+   - Each expansion level $i$ may require a database query
+   - Cache hits reduce $P_{miss}$, eliminating the need for database queries
+   - Deep nesting (large $d$) exponentially increases latency
+
+3. **Cache Impact**: As $P_{miss} \to 0$ (high cache hit rate), the summation approaches zero, reducing latency to just $L_{network} + L_{cache}$.
+
+4. **Depth Penalty**: For a 3-level expansion with 50% cache miss rate:
+   - $L_{check} = 2ms + 1ms + 3 \times (7ms \times 0.5) = 3ms + 10.5ms = 13.5ms$
+   - This matches observed P95 latencies of 10-20ms for 3-level expansions
+
+**Optimization Strategies:**
+
+- **Reduce $d$**: Flatten permission hierarchies to minimize expansion depth
+- **Increase Cache Hit Rate**: Larger cache sizes reduce $P_{miss}$
+- **Optimize $L_{db\_query}$**: Database connection pooling and query optimization
+- **Minimize $L_{network}$**: Co-locate services or use efficient serialization
+
+This mathematical model demonstrates the recursive cost structure inherent in ReBAC systems and guides performance optimization efforts.
+
 ### AS OF SYSTEM TIME Performance
 
 CockroachDB's `AS OF SYSTEM TIME` is highly optimized:
@@ -675,6 +758,52 @@ CockroachDB's `AS OF SYSTEM TIME` is highly optimized:
 **Benchmarks:**
 - Direct query: ~5ms
 - Query with `AS OF SYSTEM TIME`: ~5-6ms (minimal overhead)
+
+#### Garbage Collection Constraint and Zookie Validity
+
+CockroachDB maintains a configurable garbage collection (GC) window that limits how far back in time you can read. This constraint directly impacts Zookie validity:
+
+**GC Configuration:**
+- **Parameter**: `gc.ttlseconds` (default: 25 hours = 90,000 seconds)
+- **Purpose**: Controls how long old MVCC versions are retained before garbage collection
+- **Trade-off**: Longer GC windows require more storage but allow reading further into the past
+
+**Zookie Validity Window:**
+
+Zookies are only valid within the GC window. Attempting to read with a zookie older than `current_time - gc.ttlseconds` will fail:
+
+```
+Valid Zookie Range: [current_time - gc.ttlseconds, current_time]
+```
+
+**Example:**
+- Current time: 1766433684599320881 (nanoseconds)
+- GC window: 90,000 seconds = 90,000,000,000,000 nanoseconds
+- Valid zookie range: [1766433594599320881, 1766433684599320881]
+- Zookie 1766433500000000000 (too old) → **Query fails**
+
+**Operational Implications:**
+
+1. **Zookie Expiration**: Clients should not store zookies indefinitely. Zookies older than the GC window become invalid.
+
+2. **Error Handling**: Zenith should handle `AS OF SYSTEM TIME` errors gracefully when zookies are too old, falling back to current-time reads.
+
+3. **Monitoring**: Track zookie age to ensure they remain within the GC window. Alert if zookies approach expiration.
+
+4. **Configuration**: In production, adjust `gc.ttlseconds` based on:
+   - **Storage capacity**: Longer windows require more disk space
+   - **Read requirements**: How far back do you need to read?
+   - **Default (25 hours)**: Suitable for most use cases, allows reading recent writes
+
+**Zenith's Approach:**
+
+Zenith's `MAX(zookie, current_time)` logic in `QueryWithZookie()` provides a safety mechanism: if a zookie is too old (beyond GC window), the query will fail, but the system can detect this and handle it appropriately. However, the primary protection is ensuring zookies are used within their validity window.
+
+**Best Practices:**
+- Use zookies immediately after writes (within seconds/minutes)
+- Don't cache zookies for extended periods (>1 hour)
+- Monitor zookie age in observability metrics
+- Configure `gc.ttlseconds` based on operational requirements
 
 ### Trade-offs of Using required_zookie
 
