@@ -1,0 +1,21 @@
+services:
+  cockroachdb:
+    image: cockroachdb/cockroach:latest
+    container_name: zenith-cockroachdb
+    command: start-single-node --insecure --http-addr=:8080
+    ports:
+      - "26257:26257"  # SQL port
+      - "8080:8080"    # Admin UI
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+    environment:
+      - COCKROACH_DATABASE=zenith
+    healthcheck:
+      test: ["CMD", "cockroach", "node", "status", "--insecure"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  cockroach-data:
+

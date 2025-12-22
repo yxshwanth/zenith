@@ -1,0 +1,36 @@
+{
+  "server": {
+    "port": 50051,
+    "metrics_port": 9090,
+    "reflection": true
+  },
+  "database": {
+    "connection_string": "postgres://root@localhost:26257/zenith?sslmode=disable",
+    "max_open_conns": 25,
+    "max_idle_conns": 5,
+    "conn_max_lifetime": "5m",
+    "conn_max_idle_time": "1m",
+    "health_check_interval": "30s"
+  },
+  "cache": {
+    "enabled": true,
+    "size": 10000,
+    "ttl_positive": "30s",
+    "ttl_negative": "5s"
+  },
+  "engine": {
+    "max_depth": 10,
+    "check_timeout_ms": 10
+  },
+  "tracing": {
+    "enabled": true,
+    "endpoint": "localhost:4317"
+  },
+  "rate_limit": {
+    "enabled": false,
+    "global_rps": 1000,
+    "per_client_rps": 100,
+    "burst_size": 10
+  }
+}
+
