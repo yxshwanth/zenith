@@ -380,6 +380,83 @@ sequenceDiagram
 9. **CockroachDB ensures** → Read sees all writes with timestamp ≤ `1766433684599320881`
 10. **Server returns current zookie** → `CheckResponse { zookie: 1766433684599320882 }` (newer timestamp)
 
+### Zookie Lifecycle: Conceptual State Changes
+
+The following diagram illustrates the conceptual lifecycle of a Zookie, showing how it transitions through different states from creation to application:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Created: Write Operation Completes
+    
+    Created: Created
+    note right of Created
+        cluster_logical_timestamp()
+        returns DECIMAL string
+        Parsed to int64
+    end note
+    
+    Created --> Transmitted: Embedded in gRPC Response
+    
+    Transmitted: Transmitted
+    note right of Transmitted
+        WriteResponse { zookie }
+        CheckResponse { zookie }
+        Serialized as int64
+    end note
+    
+    Transmitted --> Stored: Client Receives & Stores
+    
+    Stored: Stored
+    note right of Stored
+        Client maintains zookie
+        for future requests
+        Opaque token
+    end note
+    
+    Stored --> Used: Client Provides required_zookie
+    
+    Used: Used
+    note right of Used
+        CheckRequest {
+        required_zookie: Z
+        }
+    end note
+    
+    Used --> Validated: Server Validates
+    
+    Validated: Validated
+    note right of Validated
+        MAX(zookie, current_time)
+        Prevents time-travel
+        Ensures freshness
+    end note
+    
+    Validated --> Applied: Query Transformation
+    
+    Applied: Applied
+    note right of Applied
+        AS OF SYSTEM TIME {zookie}
+        CockroachDB executes
+        at logical timestamp
+    end note
+    
+    Applied --> [*]: Results Returned
+    
+    Applied --> Transmitted: New Zookie Generated
+    Transmitted --> Stored: Client Updates Zookie
+```
+
+**Key State Transitions:**
+
+1. **Created**: Zookie is generated after a write operation completes, representing the logical timestamp of that write
+2. **Transmitted**: Zookie is embedded in gRPC protobuf messages and sent to clients
+3. **Stored**: Client receives and stores the zookie for future use (maintains consistency context)
+4. **Used**: Client provides the stored zookie as `required_zookie` in subsequent requests
+5. **Validated**: Server validates the zookie and applies time-travel prevention logic
+6. **Applied**: Query is transformed with `AS OF SYSTEM TIME` and executed at the specified logical timestamp
+
+This lifecycle ensures that clients can maintain causal consistency across distributed operations by tracking logical timestamps through the entire request-response cycle.
+
 ## Implementation Details
 
 ### Key Functions
@@ -614,6 +691,29 @@ CockroachDB's `AS OF SYSTEM TIME` is highly optimized:
 **Recommendation:**
 - **Use required_zookie** when consistency is critical (e.g., after writes)
 - **Omit required_zookie** when performance is critical and staleness is acceptable
+
+### Consistency vs. Latency Trade-offs
+
+The following matrix illustrates the trade-offs between different consistency modes and their associated latency characteristics:
+
+| Mode | Consistency | Latency (P99) | Use Case |
+|------|-------------|---------------|----------|
+| **No Zookie** | Eventual | ~5ms | Public browsing, low-stakes checks |
+| **With Zookie** | Causal | ~7-10ms | Critical access, immediately after a write |
+| **Strong (Max)** | Serializable | ~25ms+ | High-stakes administrative changes |
+
+**Understanding the Trade-offs:**
+
+- **No Zookie (Eventual Consistency)**: Fastest option with lowest latency, but reads may be stale. Suitable for scenarios where eventual consistency is acceptable, such as public content browsing or non-critical permission checks.
+
+- **With Zookie (Causal Consistency)**: Provides causal consistency guarantees with moderate latency increase. Ensures that reads see all writes up to the provided zookie timestamp. Ideal for critical access checks immediately after writes, where you need to ensure the write is visible.
+
+- **Strong/Max (Serializable Consistency)**: Highest consistency guarantee with highest latency. Requires distributed consensus and coordination, resulting in significantly higher latency. Reserved for high-stakes operations like administrative changes where absolute consistency is required.
+
+**Decision Framework:**
+- Choose **No Zookie** when performance is paramount and staleness is acceptable
+- Choose **With Zookie** when you need causal consistency and can tolerate ~2-5ms additional latency
+- Choose **Strong/Max** only when absolute consistency is required and latency is not a concern
 
 ## Related Documentation
 
