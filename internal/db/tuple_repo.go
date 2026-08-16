@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
@@ -82,8 +81,8 @@ func (r *TupleRepo) Delete(ctx context.Context, tuple *models.Tuple) (int64, err
 	return zookie, nil
 }
 
-// CheckDirect performs a direct lookup to see if a tuple exists
-// This is Phase 1 implementation - no recursive expansion
+// CheckDirect performs a direct lookup to see if a tuple exists.
+// Existence and the cluster logical timestamp are fetched in a single round trip.
 func (r *TupleRepo) CheckDirect(ctx context.Context, tuple *models.Tuple, requiredZookie int64) (bool, int64, error) {
 	// Create span for database lookup
 	ctx, span := observability.StartSpan(ctx, "DBLookup",
@@ -103,54 +102,51 @@ func (r *TupleRepo) CheckDirect(ctx context.Context, tuple *models.Tuple, requir
 		return false, 0, err
 	}
 
-	query := `
-		SELECT 1 FROM relation_tuples
-		WHERE namespace = $1 
-		  AND object_id = $2 
-		  AND relation = $3
-		  AND subject_namespace = $4
-		  AND subject_id = $5
-		  AND subject_relation = $6
-		LIMIT 1
-	`
+	start := time.Now()
 
-	var exists int
-	row := r.db.QueryRowWithZookie(ctx, requiredZookie, query,
+	// One round trip: existence + logical timestamp.
+	// Previously this was SELECT 1 plus a second cluster_logical_timestamp() query.
+	tuplesFrom := "relation_tuples"
+	if requiredZookie > 0 {
+		tuplesFrom = fmt.Sprintf("relation_tuples AS OF SYSTEM TIME %d", requiredZookie)
+	}
+	query := fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1 FROM %s
+			WHERE namespace = $1
+			  AND object_id = $2
+			  AND relation = $3
+			  AND subject_namespace = $4
+			  AND subject_id = $5
+			  AND subject_relation = $6
+		), cluster_logical_timestamp()::STRING
+	`, tuplesFrom)
+
+	var found bool
+	var zookieStr string
+	err := r.db.conn.QueryRowContext(ctx, query,
 		tuple.Namespace,
 		tuple.ObjectID,
 		tuple.Relation,
 		tuple.SubjectNamespace,
 		tuple.SubjectID,
-		tuple.SubjectRelation, // Empty string for direct users
-	)
-
-	err := row.Scan(&exists)
-	if err == sql.ErrNoRows {
-		// Tuple doesn't exist, get zookie and return false
-		zookie, err := r.db.GetZookie(ctx)
-		if err != nil {
-			span.RecordError(err)
-			return false, 0, fmt.Errorf("failed to get zookie: %w", err)
-		}
-		span.SetAttributes(attribute.Bool("db.found", false))
-		observability.AddZookieToSpan(span, zookie)
-		return false, zookie, nil
-	}
+		tuple.SubjectRelation,
+	).Scan(&found, &zookieStr)
 	if err != nil {
 		span.RecordError(err)
 		return false, 0, fmt.Errorf("failed to check tuple: %w", err)
 	}
 
-	// Tuple exists, get zookie and return true
-	zookie, err := r.db.GetZookie(ctx)
+	zookie, err := ParseZookieString(zookieStr)
 	if err != nil {
 		span.RecordError(err)
-		return false, 0, fmt.Errorf("failed to get zookie: %w", err)
+		return false, 0, err
 	}
 
-	span.SetAttributes(attribute.Bool("db.found", true))
+	metrics.RecordDatabaseQuery("check_direct", time.Since(start))
+	span.SetAttributes(attribute.Bool("db.found", found))
 	observability.AddZookieToSpan(span, zookie)
-	return true, zookie, nil
+	return found, zookie, nil
 }
 
 // FindUsersetDefinitions finds all tuples where the subject is a userset
@@ -206,7 +202,7 @@ func (r *TupleRepo) GetZookie(ctx context.Context) (int64, error) {
 // Optimized to use idx_reverse_expansion_covering for index-only scans
 func (r *TupleRepo) FindDirectSubjects(ctx context.Context, namespace, objectID, relation string, requiredZookie int64) ([]*models.Tuple, error) {
 	start := time.Now()
-	
+
 	// Create span for database lookup
 	ctx, span := observability.StartSpan(ctx, "DBLookup",
 		trace.WithAttributes(
@@ -279,7 +275,7 @@ func (r *TupleRepo) FindUsersetSubjects(ctx context.Context, namespace, objectID
 // FindUsersetMembers finds all members of a userset (both direct users and nested usersets)
 // Used for reverse expansion: "Who is in group:eng#member?"
 // This queries tuples where the userset is the object, not the subject
-// Returns both direct users (subject_relation = '') and nested usersets (subject_relation != '')
+// Returns both direct users (subject_relation = ”) and nested usersets (subject_relation != ”)
 func (r *TupleRepo) FindUsersetMembers(ctx context.Context, namespace, objectID, relation string, requiredZookie int64) ([]*models.Tuple, error) {
 	query := `
 		SELECT namespace, object_id, relation, subject_namespace, subject_id, subject_relation
@@ -487,4 +483,3 @@ func (r *TupleRepo) QueryHistoryAtTime(ctx context.Context, timestamp time.Time,
 	span.SetAttributes(attribute.Int("db.result_count", len(tuples)))
 	return tuples, nil
 }
-

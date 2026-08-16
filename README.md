@@ -49,6 +49,7 @@ If you have five minutes, read [The language](#the-language). If you have twenty
 - [Surfaces](#surfaces)
 - [Bring it up](#bring-it-up)
 - [Configuration](#configuration)
+- [Measured](#measured)
 - [Observability](#observability)
 - [Map of the repo](#map-of-the-repo)
 - [Further reading](#further-reading)
@@ -366,7 +367,7 @@ Zenith's cache is named **Leopard** in the code, and it is built to avoid both.
 | object_subjects | `object_subjects:{object}#{relation}` | reverse-expansion membership |
 
 **Negative caching, shorter-lived.**
-A deny is cached too — otherwise "does this random user have access?" becomes a full expansion every time. Positive TTL defaults to 30s. Negative TTL defaults to 5s. Denies go stale faster than allows, which is the correct bias: you would rather re-check a deny than serve a revoke late.
+A deny is cached too — otherwise "does this random user have access?" becomes a full expansion every time. Positive TTL defaults to 30s. Negative TTL defaults to 5s. Denies go stale faster than allows, which is the correct bias: you would rather re-check a deny than serve a revoke late. The engine caches the **finished** Check (after userset expansion), never the intermediate direct miss. Caching the miss first would turn every nested allow into a cached deny.
 
 **Soft / hard expiration.**
 Soft-expired entries are served stale while a background worker refreshes them. Hard-expired entries are dead. The check path does not wait on a thundering herd of refreshes.
@@ -566,6 +567,58 @@ Examples: [`config.example.yaml`](config.example.yaml), [`config.example.json`](
 
 ---
 
+## Measured
+
+These numbers come from `go run ./cmd/bench` against a live CockroachDB and a live `./zenith`, not from in-memory mocks.
+
+**Setup:** Apple M3, 16 GB, macOS, Go 1.25.5. CockroachDB single-node in Docker on loopback. 75,002 tuples (50k direct docs, 1k groups × 20 members, 5k group-granted docs). 20,000 Checks × 50 clients after 2,000 warmup. `check_timeout_ms=50`, tracing off.
+
+### The extra round trip is gone
+
+Every Check used to run `SELECT 1 … LIMIT 1` and then a second `SELECT cluster_logical_timestamp()`. Direct hits now fetch existence and the zookie in one statement.
+
+| SQL path (same tuple, same pool, 3,000 iters) | p50 | p99 | QPS |
+| --- | --- | --- | --- |
+| Legacy: `SELECT 1` + `GetZookie` | 297 µs | 802 µs | 3,103 |
+| Combined: `EXISTS` + zookie | **194 µs** | 1.00 ms | **4,159** |
+
+p50 is **35% lower**. Throughput is **34% higher**. The gap is a round trip; it grows with database RTT. Loopback is the conservative case.
+
+A single userset (the common nested shape) no longer spawns a goroutine to walk one child.
+
+### gRPC Check
+
+| Scenario | Cache | p50 | p99 | QPS | Result |
+| --- | --- | --- | --- | --- | --- |
+| Direct, hot key | on | **387 µs** | **0.99 ms** | **114,116** | 20,000 / 20,000 allow |
+| Nested (doc → group → user), hot key | on | **434 µs** | **1.59 ms** | **97,050** | 20,000 / 20,000 allow |
+| Deny, hot key (negative cache) | on | 374 µs | 1.13 ms | 117,222 | 0 / 20,000 allow |
+| Direct, uniform over 50k docs | on | 2.89 ms | 11.5 ms | 15,770 | allow |
+| Direct, hot key | off | 638 µs | 1.73 ms | 70,685 | 20,000 / 20,000 allow |
+| Nested, hot key | off | 1.04 ms | 2.11 ms | 45,373 | 20,000 / 20,000 allow |
+| Direct, uniform over 50k docs | off | 2.85 ms | 11.5 ms | 14,741 | allow |
+
+Hot nested Checks are **2.4× faster p50** with the cache on than off, because the engine now stores the expansion result instead of the first-hop miss.
+
+Reproduce:
+
+```bash
+docker compose up -d
+docker exec zenith-cockroachdb ./cockroach sql --insecure \
+  -e 'CREATE DATABASE IF NOT EXISTS zenith;'
+go build -o zenith ./cmd/server
+./zenith -config=config.yaml -check-timeout=50 -enable-tracing=false
+
+# another terminal
+go run ./cmd/bench -mode=seed
+go run ./cmd/bench -mode=sql
+go run ./cmd/bench -mode=load
+```
+
+Or `./scripts/bench.sh` once the server is up. Full notes: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+---
+
 ## Observability
 
 Authorization that you cannot see is authorization you cannot trust.
@@ -582,31 +635,9 @@ Authorization that you cannot see is authorization you cannot trust.
 | `zenith_batch_check_size` | how hard the console / gateway is pushing |
 | `zenith_active_connections` | pool saturation |
 
-Targets worth treating as contracts:
-
-| Signal | Aim |
-| --- | --- |
-| Direct check, cache hit | **&lt; 5 ms** |
-| Direct check, miss | **&lt; 10 ms** |
-| 2-level expansion | **10–20 ms** |
-| 3-level expansion | **20–40 ms** |
-| Cache hit rate | **&gt; 80%** in production traffic |
-| Error rate | **&lt; 0.1%** |
-
 A Grafana dashboard lives in [`scripts/dashboard.json`](scripts/dashboard.json). Tracing goes to any OTLP collector (`localhost:4317` by default); expansion depth, cache hit/miss, and zookie are span attributes, not log archaeology.
 
-Load it yourself:
-
-```bash
-ghz --insecure \
-  --proto internal/api/zenith.proto \
-  --call zenith.v1.Zenith/Check \
-  -d '{"subject_namespace":"user","subject_id":"alice","namespace":"doc","object_id":"roadmap","relation":"viewer"}' \
-  -c 10 -n 10000 \
-  localhost:50051
-```
-
-Numbers, bottlenecks, and tuning: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Latency and QPS are in [Measured](#measured), not guessed here.
 
 ---
 
@@ -615,6 +646,7 @@ Numbers, bottlenecks, and tuning: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 ```
 zenith/
 ├── cmd/server/                 process: gRPC + gateway + metrics
+├── cmd/bench/                  seed Cockroach + SQL/gRPC load numbers
 ├── internal/
 │   ├── api/zenith.proto        the contract
 │   ├── service/                validation, singleflight, BatchCheck

@@ -1,48 +1,77 @@
 # Zenith Performance Guide
 
-## Performance Characteristics
+Numbers below were measured with `go run ./cmd/bench` on 2026-08-16.
 
-Zenith is designed for sub-10ms latency for direct permission checks and <50ms for nested userset expansion (2-3 levels).
+**Machine:** Apple M3, 16 GB RAM, darwin/arm64, Go 1.25.5  
+**Database:** CockroachDB single-node (Docker), loopback  
+**Dataset:** 75,002 relation tuples — 50k direct docs, 1,000 groups × 20 members, 5k nested docs  
+**Load:** 20,000 gRPC Checks × 50 clients, 2,000 warmup, `check_timeout_ms=50`, tracing off
 
-### Typical Latencies
+Reproduce: `./scripts/bench.sh` (server must be listening on `:50051`).
 
-- **Direct Check**: <5ms (cache hit) to <10ms (cache miss)
-- **2-Level Expansion**: 10-20ms
-- **3-Level Expansion**: 20-40ms
-- **Deep Nesting (5+ levels)**: 40-100ms (may timeout)
+## What changed
 
-### Throughput
+1. **One SQL round trip per direct lookup.** `CheckDirect` used to `SELECT 1` and then `SELECT cluster_logical_timestamp()`. It now returns existence and the zookie together.
+2. **Single-userset expansion stays on the calling goroutine.** Fan-out is only for two or more userset branches.
+3. **Cache stores the finished Check.** A direct miss is not written to the LRU before userset expansion; doing so cached nested allows as denies.
 
-- **With Caching**: 5,000-10,000 requests/second per instance
-- **Without Caching**: 1,000-2,000 requests/second per instance
-- **Write Operations**: 500-1,000 operations/second
+## SQL microbench (no gRPC)
 
-## Benchmark Results
+Same tuple, same connection pool, 3,000 iterations after 200 warmup.
 
-### Check Operations
+| Path | p50 | p95 | p99 | avg | QPS |
+| --- | --- | --- | --- | --- | --- |
+| Legacy 2-RTT (`SELECT 1` + `GetZookie`) | 297 µs | 454 µs | 802 µs | 322 µs | 3,103 |
+| Combined 1-RTT (`EXISTS` + zookie) | 194 µs | 453 µs | 1.00 ms | 240 µs | 4,159 |
+
+p50 −35%. Throughput +34%. This is loopback; a 1 ms database RTT would make the two-query path ~2× the one-query path.
+
+## gRPC Check
+
+### Cache on
+
+| Scenario | p50 | p95 | p99 | avg | QPS | Allows |
+| --- | --- | --- | --- | --- | --- | --- |
+| Direct, hot key | 387 µs | 807 µs | 996 µs | 437 µs | 114,116 | 20,000 / 20,000 |
+| Nested hot (doc → group#member → user) | 434 µs | 1.10 ms | 1.59 ms | 514 µs | 97,050 | 20,000 / 20,000 |
+| Deny, hot key | 374 µs | 814 µs | 1.13 ms | 426 µs | 117,222 | 0 / 20,000 |
+| Direct, uniform over 50k docs | 2.89 ms | 7.47 ms | 11.5 ms | 3.17 ms | 15,770 | allow |
+
+### Cache off
+
+| Scenario | p50 | p95 | p99 | avg | QPS | Allows |
+| --- | --- | --- | --- | --- | --- | --- |
+| Direct, hot key | 638 µs | 1.25 ms | 1.73 ms | 706 µs | 70,685 | 20,000 / 20,000 |
+| Nested hot | 1.04 ms | 1.54 ms | 2.11 ms | 1.10 ms | 45,373 | 20,000 / 20,000 |
+| Deny, hot key | 812 µs | 1.35 ms | 1.71 ms | 879 µs | 56,815 | 0 / 20,000 |
+| Direct, uniform over 50k docs | 2.85 ms | 6.57 ms | 11.5 ms | 3.39 ms | 14,741 | allow |
+
+Nested hot p50 is 2.4× lower with the cache on (434 µs vs 1.04 ms) because the cached value is the expansion result.
+
+## In-process Go benchmarks
+
+These hit an in-memory mock repo. They are useful for allocator regressions, not for latency SLOs.
 
 ```
-BenchmarkCheck_Direct-8             50000    25000 ns/op    5000 B/op    50 allocs/op
-BenchmarkCheck_Nested-8              20000    60000 ns/op   12000 B/op   120 allocs/op
+go test -bench=. -benchmem ./internal/engine ./internal/cache ./internal/service
 ```
 
-### Expansion Engine
+## How to run
 
-```
-BenchmarkExpansion_Direct-8          50000    24000 ns/op    4800 B/op    48 allocs/op
-BenchmarkExpansion_2Level-8          30000    45000 ns/op    9000 B/op    90 allocs/op
-BenchmarkExpansion_3Level-8         20000    75000 ns/op   15000 B/op   150 allocs/op
-```
-
-### Cache Operations
-
-```
-BenchmarkCache_GetSet-8             200000     8000 ns/op    1600 B/op    16 allocs/op
-BenchmarkCache_GetSetWithPatterns-8 150000    10000 ns/op    2000 B/op    20 allocs/op
-BenchmarkCache_InvalidateRelated-8   50000    25000 ns/op    5000 B/op    50 allocs/op
+```bash
+docker compose up -d
+docker exec zenith-cockroachdb ./cockroach sql --insecure -e 'CREATE DATABASE IF NOT EXISTS zenith;'
+go build -o zenith ./cmd/server
+./zenith -config=config.yaml -check-timeout=50 -enable-tracing=false
 ```
 
-*Note: Benchmark results vary based on hardware and load. Run your own benchmarks for accurate numbers.*
+```bash
+go run ./cmd/bench -mode=seed
+go run ./cmd/bench -mode=sql
+go run ./cmd/bench -mode=load -n=20000 -c=50
+```
+
+Flags: `-direct-docs`, `-groups`, `-members`, `-nested-docs`, `-scenario=direct_hot|direct_uniform|nested_hot|deny|all`.
 
 ## Performance Optimization Tips
 
@@ -288,12 +317,13 @@ done
 
 ## Performance Targets
 
-- **P50 Latency**: <10ms for direct checks
-- **P95 Latency**: <50ms for 2-level expansion
-- **P99 Latency**: <100ms for 3-level expansion
-- **Cache Hit Rate**: >80%
-- **Throughput**: >5,000 requests/second per instance (with cache)
-- **Error Rate**: <0.1%
+Measured on loopback M3 (see tables above). Treat these as the bar for a regression:
+
+- **Hot direct Check, cache on:** p50 < 1 ms, p99 < 2 ms
+- **Hot nested Check, cache on:** p50 < 1 ms, p99 < 3 ms
+- **Uniform direct over a large keyspace:** p50 < 5 ms, p99 < 15 ms
+- **Hot nested vs cache off:** cache-on p50 should stay ~2× better
+- **SQL CheckDirect:** combined 1-RTT p50 should beat legacy 2-RTT
 
 ## Troubleshooting Performance Issues
 

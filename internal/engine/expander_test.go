@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/zenith/zenith/internal/cache"
 	"github.com/zenith/zenith/internal/models"
 )
 
@@ -118,7 +120,7 @@ func TestExpansionEngine_DirectCheck(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -164,7 +166,7 @@ func TestExpansionEngine_SimpleUserset(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -218,7 +220,7 @@ func TestExpansionEngine_NestedUsersets(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -263,7 +265,7 @@ func TestExpansionEngine_CycleDetection(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -316,7 +318,7 @@ func TestExpansionEngine_MaxDepth(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -351,7 +353,7 @@ func TestExpansionEngine_Timeout(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -407,7 +409,7 @@ func TestExpansionEngine_ConcurrentChecks(t *testing.T) {
 		SubjectNamespace: "user",
 		SubjectID:        "alice",
 		SubjectRelation:  "",
-		ObjectNamespace: "doc",
+		ObjectNamespace:  "doc",
 		ObjectID:         "doc_1",
 		Relation:         "viewer",
 		RequiredZookie:   0,
@@ -422,3 +424,35 @@ func TestExpansionEngine_ConcurrentChecks(t *testing.T) {
 	}
 }
 
+func TestExpansionEngine_CacheDoesNotPoisonNested(t *testing.T) {
+	repo := NewMockTupleRepo()
+	c, err := cache.NewCache(128, 30*time.Second, 5*time.Second)
+	if err != nil {
+		t.Fatalf("cache: %v", err)
+	}
+	eng := NewExpansionEngineWithCache(repo, c, 10, 100)
+
+	repo.Insert(context.Background(), &models.Tuple{
+		Namespace: "doc", ObjectID: "doc_1", Relation: "viewer",
+		SubjectNamespace: "group", SubjectID: "eng", SubjectRelation: "member",
+	})
+	repo.Insert(context.Background(), &models.Tuple{
+		Namespace: "group", ObjectID: "eng", Relation: "member",
+		SubjectNamespace: "user", SubjectID: "alice", SubjectRelation: "",
+	})
+
+	req := &CheckRequest{
+		SubjectNamespace: "user", SubjectID: "alice",
+		ObjectNamespace: "doc", ObjectID: "doc_1", Relation: "viewer",
+	}
+
+	for i := 0; i < 3; i++ {
+		allowed, _, err := eng.Check(context.Background(), req)
+		if err != nil {
+			t.Fatalf("check %d: %v", i, err)
+		}
+		if !allowed {
+			t.Fatalf("check %d: nested allow was cached as deny", i)
+		}
+	}
+}

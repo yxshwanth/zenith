@@ -20,8 +20,8 @@ type PoolConfig struct {
 
 // DB wraps the database connection and provides Zookie utilities
 type DB struct {
-	conn     *sql.DB
-	poolCfg  *PoolConfig
+	conn            *sql.DB
+	poolCfg         *PoolConfig
 	stopHealthCheck chan struct{}
 }
 
@@ -60,8 +60,8 @@ func NewDBWithConfig(connString string, poolCfg *PoolConfig) (*DB, error) {
 	}
 
 	db := &DB{
-		conn:     conn,
-		poolCfg:  poolCfg,
+		conn:            conn,
+		poolCfg:         poolCfg,
 		stopHealthCheck: make(chan struct{}),
 	}
 
@@ -112,22 +112,21 @@ func (db *DB) GetZookie(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("failed to get zookie: %w", err)
 	}
-	
-	// Parse the decimal string (format: "1766433684599320881.0000000000")
-	// Extract the integer part before the decimal point
+	return ParseZookieString(zookieStr)
+}
+
+// ParseZookieString converts CockroachDB's DECIMAL timestamp string to int64.
+// Format is typically "1766433684599320881.0000000000".
+func ParseZookieString(zookieStr string) (int64, error) {
 	var zookie int64
-	_, err = fmt.Sscanf(zookieStr, "%d", &zookie)
-	if err != nil {
-		// Try parsing as float64 first, then convert
-		var zookieFloat float64
-		_, err = fmt.Sscanf(zookieStr, "%f", &zookieFloat)
-		if err != nil {
-			return 0, fmt.Errorf("failed to parse zookie: %w", err)
-		}
-		zookie = int64(zookieFloat)
+	if _, err := fmt.Sscanf(zookieStr, "%d", &zookie); err == nil {
+		return zookie, nil
 	}
-	
-	return zookie, nil
+	var zookieFloat float64
+	if _, err := fmt.Sscanf(zookieStr, "%f", &zookieFloat); err != nil {
+		return 0, fmt.Errorf("failed to parse zookie %q: %w", zookieStr, err)
+	}
+	return int64(zookieFloat), nil
 }
 
 // ValidateZookie checks if a zookie value is reasonable
@@ -155,7 +154,7 @@ func (db *DB) QueryWithZookie(ctx context.Context, zookie int64, query string, a
 			// Invalid zookie, log warning but proceed with current time
 			// This shouldn't happen in normal operation
 		}
-		
+
 		// Get current database time to prevent time-travel bugs
 		// Use MAX(zookie, current_time) to ensure we never read data older than "now"
 		currentTime, err := db.GetZookie(ctx)
@@ -184,7 +183,7 @@ func (db *DB) QueryRowWithZookie(ctx context.Context, zookie int64, query string
 			// Invalid zookie, log warning but proceed with current time
 			// This shouldn't happen in normal operation
 		}
-		
+
 		// Get current database time to prevent time-travel bugs
 		// Use MAX(zookie, current_time) to ensure we never read data older than "now"
 		currentTime, err := db.GetZookie(ctx)
@@ -229,4 +228,3 @@ func (db *DB) RunMigrations(ctx context.Context, migrations []string) error {
 	}
 	return nil
 }
-

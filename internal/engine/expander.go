@@ -157,31 +157,30 @@ func (e *ExpansionEngine) expand(ctx context.Context, req *CheckRequest, visited
 		attribute.Bool("db.allowed", allowed),
 	)
 
-	// Store in cache (if enabled)
-	if e.cache != nil {
+	cacheResult := func(final bool, zk int64) {
+		if e.cache == nil {
+			return
+		}
 		cacheKey := cache.CheckKey(
 			req.SubjectNamespace, req.SubjectID, req.SubjectRelation,
 			req.ObjectNamespace, req.ObjectID, req.Relation,
 		)
-		// Use SetCheckWithPatterns to enable selective invalidation
 		e.cache.SetCheckWithPatterns(
-			cacheKey, allowed, zookie,
+			cacheKey, final, zk,
 			req.ObjectNamespace, req.ObjectID, req.Relation,
 			req.SubjectNamespace, req.SubjectID, req.SubjectRelation,
 		)
 		span.AddEvent("cache_set", trace.WithAttributes(
 			attribute.String("cache.key", cacheKey),
+			attribute.Bool("cache.allowed", final),
 		))
 	}
 
 	if allowed {
-		// Return with zookie from direct check
-		// This zookie respects the required_zookie via AS OF SYSTEM TIME MAX
+		cacheResult(true, zookie)
 		return true, zookie, nil
 	}
 
-	// Direct check failed, look for userset definitions
-	// All queries use the same required_zookie for consistency
 	span.AddEvent("db_query", trace.WithAttributes(
 		attribute.String("db.operation", "FindUsersetDefinitions"),
 	))
@@ -192,105 +191,88 @@ func (e *ExpansionEngine) expand(ctx context.Context, req *CheckRequest, visited
 	}
 	span.SetAttributes(attribute.Int("db.userset_count", len(usersets)))
 
-	// No userset definitions found, permission denied
-	// Return zookie from direct check for consistency (even though it was false)
 	if len(usersets) == 0 {
-		// Use the zookie from the direct check to maintain consistency
-		// This ensures the zookie reflects the state at the time of the check
+		cacheResult(false, zookie)
 		return false, zookie, nil
 	}
 
-	// Recursively check each userset definition concurrently
-	return e.expandUsersets(ctx, req, usersets, visited, depth)
+	allowed, zookie, err = e.expandUsersets(ctx, req, usersets, visited, depth)
+	if err != nil {
+		return false, zookie, err
+	}
+	cacheResult(allowed, zookie)
+	return allowed, zookie, nil
 }
 
-// expandUsersets expands multiple userset definitions concurrently
+func usersetCheckRequest(req *CheckRequest, us *models.Tuple) *CheckRequest {
+	return &CheckRequest{
+		SubjectNamespace: req.SubjectNamespace,
+		SubjectID:        req.SubjectID,
+		SubjectRelation:  req.SubjectRelation,
+		ObjectNamespace:  us.SubjectNamespace,
+		ObjectID:         us.SubjectID,
+		Relation:         us.SubjectRelation,
+		RequiredZookie:   req.RequiredZookie,
+	}
+}
+
+// expandUsersets expands userset definitions. A single userset (the common case)
+// recurses on this goroutine; multiple usersets fan out and OR the results.
 func (e *ExpansionEngine) expandUsersets(ctx context.Context, req *CheckRequest, usersets []*models.Tuple, visited *visitedSet, depth int) (bool, int64, error) {
-	// Use a channel to collect results
+	if len(usersets) == 1 {
+		return e.expand(ctx, usersetCheckRequest(req, usersets[0]), visited, depth+1)
+	}
+
 	resultChan := make(chan expandResult, len(usersets))
 	var wg sync.WaitGroup
 
-	// Spawn goroutine for each userset definition
 	for _, userset := range usersets {
 		wg.Add(1)
 		go func(us *models.Tuple) {
 			defer wg.Done()
 
-			// Create new check request for the userset
-			// We're checking if the subject has the userset's relation on the userset's object
-			newReq := &CheckRequest{
-				SubjectNamespace: req.SubjectNamespace,
-				SubjectID:        req.SubjectID,
-				SubjectRelation:  req.SubjectRelation,
-				ObjectNamespace: us.SubjectNamespace,
-				ObjectID:         us.SubjectID,
-				Relation:         us.SubjectRelation, // The relation from the userset
-				RequiredZookie:   req.RequiredZookie,
-			}
-
-			// Recursively expand
-			allowed, zookie, err := e.expand(ctx, newReq, visited, depth+1)
+			allowed, zookie, err := e.expand(ctx, usersetCheckRequest(req, us), visited, depth+1)
 			if err != nil {
-				// Only send error if not a timeout (timeouts are expected in some cases)
 				if ctx.Err() != context.DeadlineExceeded {
 					resultChan <- expandResult{allowed: false, zookie: 0, err: err}
 				}
 				return
 			}
-
-			// If allowed, send result immediately (early termination)
-			if allowed {
-				resultChan <- expandResult{allowed: true, zookie: zookie, err: nil}
-			}
+			resultChan <- expandResult{allowed: allowed, zookie: zookie, err: nil}
 		}(userset)
 	}
 
-	// Close result channel when all goroutines complete
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 
-	// Collect first true result (OR logic: any path grants permission)
-	// Track max zookie across all paths for consistency
 	var maxZookie int64
 	for result := range resultChan {
 		if result.err != nil {
-			// Log error but continue checking other paths
 			continue
 		}
-		// Track max zookie for consistency across all paths
 		if result.zookie > maxZookie {
 			maxZookie = result.zookie
 		}
 		if result.allowed {
-			// Found a path that grants permission
-			// Return with max zookie seen so far (ensures consistency)
-			// This ensures all concurrent paths contribute to the final zookie
 			return true, maxZookie, nil
 		}
 	}
 
-	// Check if context was cancelled
-	select {
-	case <-ctx.Done():
-		zookie, err := e.repo.GetZookie(ctx)
-		if err != nil {
-			return false, 0, fmt.Errorf("failed to get zookie: %w", err)
-		}
-		return false, zookie, ctx.Err()
-	default:
-	}
-
-	// No path granted permission, return false with max zookie
 	if maxZookie == 0 {
 		zookie, err := e.repo.GetZookie(ctx)
 		if err != nil {
 			return false, 0, fmt.Errorf("failed to get zookie: %w", err)
 		}
+		if ctx.Err() != nil {
+			return false, zookie, ctx.Err()
+		}
 		return false, zookie, nil
 	}
-
+	if ctx.Err() != nil {
+		return false, maxZookie, ctx.Err()
+	}
 	return false, maxZookie, nil
 }
 
@@ -300,5 +282,3 @@ type expandResult struct {
 	zookie  int64
 	err     error
 }
-
-
