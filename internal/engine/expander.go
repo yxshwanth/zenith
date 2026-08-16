@@ -125,23 +125,37 @@ func (e *ExpansionEngine) expand(ctx context.Context, req *CheckRequest, visited
 		SubjectRelation:  req.SubjectRelation,
 	}
 
-	// Check cache first (if enabled)
+	// Check cache first (if enabled) with tracing
 	if e.cache != nil {
 		cacheKey := cache.CheckKey(
 			req.SubjectNamespace, req.SubjectID, req.SubjectRelation,
 			req.ObjectNamespace, req.ObjectID, req.Relation,
 		)
-		if entry, ok := e.cache.GetCheck(cacheKey); ok {
+		if entry, ok := e.cache.GetCheckWithContext(ctx, cacheKey); ok {
 			// Cache hit - return cached result
+			span.AddEvent("cache_hit", trace.WithAttributes(
+				attribute.String("cache.key", cacheKey),
+				attribute.Bool("cache.allowed", entry.Allowed),
+			))
 			return entry.Allowed, entry.Zookie, nil
 		}
+		span.AddEvent("cache_miss", trace.WithAttributes(
+			attribute.String("cache.key", cacheKey),
+		))
 	}
 
 	// Direct check with required_zookie (ensures consistency)
+	span.AddEvent("db_query", trace.WithAttributes(
+		attribute.String("db.operation", "CheckDirect"),
+	))
 	allowed, zookie, err := e.repo.CheckDirect(ctx, tuple, req.RequiredZookie)
 	if err != nil {
+		span.RecordError(err)
 		return false, 0, fmt.Errorf("direct check failed: %w", err)
 	}
+	span.SetAttributes(
+		attribute.Bool("db.allowed", allowed),
+	)
 
 	// Store in cache (if enabled)
 	if e.cache != nil {
@@ -155,6 +169,9 @@ func (e *ExpansionEngine) expand(ctx context.Context, req *CheckRequest, visited
 			req.ObjectNamespace, req.ObjectID, req.Relation,
 			req.SubjectNamespace, req.SubjectID, req.SubjectRelation,
 		)
+		span.AddEvent("cache_set", trace.WithAttributes(
+			attribute.String("cache.key", cacheKey),
+		))
 	}
 
 	if allowed {
@@ -165,10 +182,15 @@ func (e *ExpansionEngine) expand(ctx context.Context, req *CheckRequest, visited
 
 	// Direct check failed, look for userset definitions
 	// All queries use the same required_zookie for consistency
+	span.AddEvent("db_query", trace.WithAttributes(
+		attribute.String("db.operation", "FindUsersetDefinitions"),
+	))
 	usersets, err := e.repo.FindUsersetDefinitions(ctx, req.ObjectNamespace, req.ObjectID, req.Relation, req.RequiredZookie)
 	if err != nil {
+		span.RecordError(err)
 		return false, 0, fmt.Errorf("failed to find userset definitions: %w", err)
 	}
+	span.SetAttributes(attribute.Int("db.userset_count", len(usersets)))
 
 	// No userset definitions found, permission denied
 	// Return zookie from direct check for consistency (even though it was false)

@@ -1,23 +1,34 @@
 package cache
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/zenith/zenith/internal/observability"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // CacheEntry represents a cached permission check result
 type CacheEntry struct {
-	Allowed bool
-	Zookie  int64
-	Expires time.Time
+	Allowed    bool
+	Zookie     int64
+	Expires    time.Time
+	SoftExpires time.Time // Soft expiration: serve stale while refreshing
+	HardExpires time.Time // Hard expiration: must refresh before serving
 }
 
-// IsExpired checks if the cache entry has expired
+// IsExpired checks if the cache entry has expired (hard expiration)
 func (e *CacheEntry) IsExpired() bool {
-	return time.Now().After(e.Expires)
+	return time.Now().After(e.HardExpires)
+}
+
+// IsSoftExpired checks if the cache entry has soft expired (can serve stale)
+func (e *CacheEntry) IsSoftExpired() bool {
+	return time.Now().After(e.SoftExpires)
 }
 
 // ObjectSubjectsEntry represents a cached object subjects result
@@ -47,6 +58,13 @@ type Cache struct {
 	mu                  sync.RWMutex
 	ttlPositive         time.Duration
 	ttlNegative         time.Duration
+	ttlSoft              time.Duration // Soft expiration TTL (default: 30s)
+	ttlHard              time.Duration // Hard expiration TTL (default: 5m)
+	
+	// Background refresh
+	refreshWorkers      int           // Number of background refresh workers
+	refreshChan         chan string   // Channel for keys to refresh
+	refreshFunc         func(context.Context, string) // Function to refresh a key
 	
 	// Reverse indexes for selective invalidation
 	// Maps object pattern (namespace:objectID#relation) to set of cache keys
@@ -57,6 +75,11 @@ type Cache struct {
 
 // NewCache creates a new cache with the specified size and TTLs
 func NewCache(size int, ttlPositive, ttlNegative time.Duration) (*Cache, error) {
+	return NewCacheWithHierarchy(size, ttlPositive, ttlNegative, 30*time.Second, 5*time.Minute, 10)
+}
+
+// NewCacheWithHierarchy creates a new cache with soft/hard expiration hierarchy
+func NewCacheWithHierarchy(size int, ttlPositive, ttlNegative, ttlSoft, ttlHard time.Duration, refreshWorkers int) (*Cache, error) {
 	checkCache, err := lru.New[string, *CacheEntry](size)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create check cache: %w", err)
@@ -72,31 +95,100 @@ func NewCache(size int, ttlPositive, ttlNegative time.Duration) (*Cache, error) 
 		return nil, fmt.Errorf("failed to create object subjects cache: %w", err)
 	}
 
-	return &Cache{
+	c := &Cache{
 		checkCache:         checkCache,
 		usersetCache:       usersetCache,
 		objectSubjectsCache: objectSubjectsCache,
 		ttlPositive:        ttlPositive,
 		ttlNegative:        ttlNegative,
+		ttlSoft:            ttlSoft,
+		ttlHard:            ttlHard,
+		refreshWorkers:     refreshWorkers,
+		refreshChan:        make(chan string, 100), // Buffer for refresh requests
 		objectIndex:        make(map[string]map[string]bool),
 		subjectIndex:        make(map[string]map[string]bool),
-	}, nil
+	}
+
+	// Start background refresh workers
+	for i := 0; i < refreshWorkers; i++ {
+		go c.refreshWorker(context.Background())
+	}
+
+	return c, nil
+}
+
+// refreshWorker processes background refresh requests
+func (c *Cache) refreshWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case key := <-c.refreshChan:
+			if c.refreshFunc != nil {
+				c.refreshFunc(ctx, key)
+			}
+		}
+	}
+}
+
+// SetRefreshFunc sets the function to call for background refreshes
+func (c *Cache) SetRefreshFunc(fn func(context.Context, string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.refreshFunc = fn
 }
 
 // GetCheck retrieves a cached check result
 func (c *Cache) GetCheck(key string) (*CacheEntry, bool) {
+	return c.GetCheckWithContext(context.Background(), key)
+}
+
+// GetCheckWithContext retrieves a cached check result with tracing
+func (c *Cache) GetCheckWithContext(ctx context.Context, key string) (*CacheEntry, bool) {
+	ctx, span := observability.StartSpan(ctx, "cache.lookup",
+		trace.WithAttributes(
+			attribute.String("cache.type", "check"),
+			attribute.String("cache.key", key),
+		),
+	)
+	defer span.End()
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	entry, ok := c.checkCache.Get(key)
 	if !ok {
+		span.AddEvent("cache_miss", trace.WithAttributes(
+			attribute.Bool("cache.hit", false),
+		))
+		span.SetAttributes(attribute.Bool("cache.hit", false))
 		return nil, false
 	}
 
 	// Check if expired
 	if entry.IsExpired() {
 		c.checkCache.Remove(key)
+		span.AddEvent("cache_expired", trace.WithAttributes(
+			attribute.Bool("cache.hit", false),
+			attribute.Bool("cache.expired", true),
+		))
+		span.SetAttributes(
+			attribute.Bool("cache.hit", false),
+			attribute.Bool("cache.expired", true),
+		)
 		return nil, false
+	}
+
+	span.AddEvent("cache_hit", trace.WithAttributes(
+		attribute.Bool("cache.hit", true),
+		attribute.Bool("cache.allowed", entry.Allowed),
+	))
+	span.SetAttributes(
+		attribute.Bool("cache.hit", true),
+		attribute.Bool("cache.allowed", entry.Allowed),
+	)
+	if entry.Zookie > 0 {
+		observability.AddZookieToSpan(span, entry.Zookie)
 	}
 
 	return entry, true
@@ -144,10 +236,13 @@ func (c *Cache) SetCheck(key string, allowed bool, zookie int64) {
 		ttl = c.ttlNegative // Negative results have shorter TTL
 	}
 
+	now := time.Now()
 	entry := &CacheEntry{
-		Allowed: allowed,
-		Zookie:  zookie,
-		Expires: time.Now().Add(ttl),
+		Allowed:     allowed,
+		Zookie:      zookie,
+		Expires:      now.Add(ttl),
+		SoftExpires: now.Add(c.ttlSoft),
+		HardExpires: now.Add(c.ttlHard),
 	}
 
 	c.checkCache.Add(key, entry)
@@ -169,10 +264,13 @@ func (c *Cache) SetCheckWithPatterns(key string, allowed bool, zookie int64, obj
 		ttl = c.ttlNegative
 	}
 
+	now := time.Now()
 	entry := &CacheEntry{
-		Allowed: allowed,
-		Zookie:  zookie,
-		Expires: time.Now().Add(ttl),
+		Allowed:     allowed,
+		Zookie:      zookie,
+		Expires:      now.Add(ttl),
+		SoftExpires: now.Add(c.ttlSoft),
+		HardExpires: now.Add(c.ttlHard),
 	}
 
 	c.checkCache.Add(key, entry)
@@ -186,6 +284,47 @@ func (c *Cache) SetCheckWithPatterns(key string, allowed bool, zookie int64, obj
 		subPattern := subjectPattern(subjectNamespace, subjectID, subjectRelation)
 		c.addToIndex(c.subjectIndex, subPattern, key)
 	}
+}
+
+// GetOrRefresh retrieves a cache entry with soft/hard expiration handling
+// If soft expired, serves stale data and triggers background refresh
+// If hard expired, must refresh before serving
+func (c *Cache) GetOrRefresh(ctx context.Context, key string) (*CacheEntry, bool) {
+	c.mu.RLock()
+	entry, ok := c.checkCache.Get(key)
+	c.mu.RUnlock()
+
+	if !ok {
+		return nil, false
+	}
+
+	now := time.Now()
+
+	// Hard expired: must refresh
+	if now.After(entry.HardExpires) {
+		// Trigger refresh in background
+		select {
+		case c.refreshChan <- key:
+		default:
+			// Channel full, skip refresh
+		}
+		return nil, false
+	}
+
+	// Soft expired: serve stale and refresh in background
+	if now.After(entry.SoftExpires) {
+		// Trigger background refresh
+		select {
+		case c.refreshChan <- key:
+		default:
+			// Channel full, skip refresh
+		}
+		// Return stale entry
+		return entry, true
+	}
+
+	// Fresh: return directly
+	return entry, true
 }
 
 // GetUserset retrieves a cached userset result

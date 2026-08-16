@@ -14,6 +14,10 @@ service Zenith {
   
   // ListSubjects returns all subjects that have a relation on an object (reverse expansion)
   rpc ListSubjects(ListSubjectsRequest) returns (ListSubjectsResponse);
+  
+  // BatchCheck processes multiple permission checks in a single call
+  // Up to 30 checks can be processed in parallel
+  rpc BatchCheck(BatchCheckRequest) returns (BatchCheckResponse);
 }
 
 // RelationTuple represents a single permission relationship
@@ -84,5 +88,23 @@ message Subject {
 message ListSubjectsResponse {
   repeated Subject subjects = 1;  // List of subjects with the relation
   int64 zookie = 2;               // Logical timestamp of the check
+}
+
+// CheckResult represents the result of a single check in a batch
+message CheckResult {
+  bool allowed = 1;   // True if subject has the relation on object
+  int64 zookie = 2;   // Logical timestamp of the check
+}
+
+// BatchCheckRequest contains multiple CheckRequest items to process
+message BatchCheckRequest {
+  repeated CheckRequest requests = 1;  // Up to 30 checks
+  int64 required_zookie = 2;          // Optional: ensure all checks are at least this fresh
+}
+
+// BatchCheckResponse returns results for all checks in the batch
+message BatchCheckResponse {
+  repeated CheckResult results = 1;  // Results in the same order as requests
+  int64 zookie = 2;                  // Max zookie across all checks (for consistency)
 }
 

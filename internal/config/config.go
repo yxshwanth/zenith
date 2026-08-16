@@ -13,18 +13,21 @@ import (
 
 // Config holds all configuration for Zenith
 type Config struct {
-	Server   ServerConfig   `yaml:"server" json:"server"`
-	Database DatabaseConfig `yaml:"database" json:"database"`
-	Cache    CacheConfig    `yaml:"cache" json:"cache"`
-	Engine   EngineConfig   `yaml:"engine" json:"engine"`
-	Tracing  TracingConfig  `yaml:"tracing" json:"tracing"`
-	RateLimit RateLimitConfig `yaml:"rate_limit" json:"rate_limit"`
+	Server        ServerConfig        `yaml:"server" json:"server"`
+	Database      DatabaseConfig      `yaml:"database" json:"database"`
+	Cache         CacheConfig         `yaml:"cache" json:"cache"`
+	Engine        EngineConfig        `yaml:"engine" json:"engine"`
+	Tracing       TracingConfig       `yaml:"tracing" json:"tracing"`
+	RateLimit     RateLimitConfig     `yaml:"rate_limit" json:"rate_limit"`
+	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker" json:"circuit_breaker"`
+	Redis         RedisConfig         `yaml:"redis" json:"redis"`
 }
 
 // ServerConfig holds server-related configuration
 type ServerConfig struct {
 	Port         int  `yaml:"port" json:"port"`
 	MetricsPort  int  `yaml:"metrics_port" json:"metrics_port"`
+	HTTPPort     int  `yaml:"http_port" json:"http_port"` // HTTP gateway port
 	Reflection   bool `yaml:"reflection" json:"reflection"`
 }
 
@@ -66,12 +69,34 @@ type RateLimitConfig struct {
 	BurstSize    int   `yaml:"burst_size" json:"burst_size"`      // Burst allowance
 }
 
+// CircuitBreakerConfig holds circuit breaker configuration
+type CircuitBreakerConfig struct {
+	Enabled            bool          `yaml:"enabled" json:"enabled"`
+	FailureThreshold   float64       `yaml:"failure_threshold" json:"failure_threshold"`     // Percentage (0-100)
+	FailureWindow      time.Duration `yaml:"failure_window" json:"failure_window"`           // Time window for failure calculation
+	OpenDuration       time.Duration `yaml:"open_duration" json:"open_duration"`             // How long circuit stays open
+	HalfOpenMaxRequests int          `yaml:"half_open_max_requests" json:"half_open_max_requests"` // Max requests in half-open
+	MinRequests        int           `yaml:"min_requests" json:"min_requests"`               // Min requests before opening
+}
+
+// RedisConfig holds Redis configuration for distributed deduplication
+type RedisConfig struct {
+	Enabled        bool          `yaml:"enabled" json:"enabled"`
+	ConnectionString string      `yaml:"connection_string" json:"connection_string"` // Redis connection string
+	PoolSize      int           `yaml:"pool_size" json:"pool_size"`                   // Connection pool size
+	MinIdleConns  int           `yaml:"min_idle_conns" json:"min_idle_conns"`         // Minimum idle connections
+	KeyPrefix     string        `yaml:"key_prefix" json:"key_prefix"`                 // Key prefix for Redis keys
+	LockTTL       time.Duration `yaml:"lock_ttl" json:"lock_ttl"`                     // TTL for lock keys
+	ResultTTL     time.Duration `yaml:"result_ttl" json:"result_ttl"`                 // TTL for result cache
+}
+
 // DefaultConfig returns a configuration with sensible defaults
 func DefaultConfig() *Config {
 	return &Config{
 		Server: ServerConfig{
 			Port:        50051,
 			MetricsPort: 9090,
+			HTTPPort:    8080,
 			Reflection:  true,
 		},
 		Database: DatabaseConfig{
@@ -101,6 +126,23 @@ func DefaultConfig() *Config {
 			GlobalRPS:    1000,
 			PerClientRPS: 100,
 			BurstSize:    10,
+		},
+		CircuitBreaker: CircuitBreakerConfig{
+			Enabled:            false,
+			FailureThreshold:   50.0,
+			FailureWindow:      1 * time.Minute,
+			OpenDuration:        30 * time.Second,
+			HalfOpenMaxRequests: 5,
+			MinRequests:         10,
+		},
+		Redis: RedisConfig{
+			Enabled:         false,
+			ConnectionString: "redis://localhost:6379/0",
+			PoolSize:       10,
+			MinIdleConns:   5,
+			KeyPrefix:      "zenith:dedup:",
+			LockTTL:        5 * time.Second,
+			ResultTTL:      10 * time.Second,
 		},
 	}
 }
@@ -259,6 +301,11 @@ func Load(configFile string) (*Config, error) {
 
 	// Override with environment variables
 	envConfig := LoadFromEnv()
+	// Only merge if env var is explicitly set (check via os.Getenv)
+	if os.Getenv("ZENITH_SERVER_HTTP_PORT") == "" {
+		// Don't merge HTTPPort from env if env var not set
+		envConfig.Server.HTTPPort = 0
+	}
 	config = mergeConfig(config, envConfig)
 
 	// Validate configuration
@@ -279,6 +326,9 @@ func mergeConfig(base, env *Config) *Config {
 	}
 	if env.Server.MetricsPort != 0 {
 		merged.Server.MetricsPort = env.Server.MetricsPort
+	}
+	if env.Server.HTTPPort != 0 {
+		merged.Server.HTTPPort = env.Server.HTTPPort
 	}
 	if os.Getenv("ZENITH_SERVER_REFLECTION") != "" {
 		merged.Server.Reflection = env.Server.Reflection
@@ -354,8 +404,11 @@ func (c *Config) Validate() error {
 	if c.Server.MetricsPort <= 0 || c.Server.MetricsPort > 65535 {
 		return fmt.Errorf("metrics port must be between 1 and 65535, got %d", c.Server.MetricsPort)
 	}
-	if c.Server.Port == c.Server.MetricsPort {
-		return fmt.Errorf("server port and metrics port cannot be the same")
+	if c.Server.HTTPPort <= 0 || c.Server.HTTPPort > 65535 {
+		return fmt.Errorf("http port must be between 1 and 65535, got %d", c.Server.HTTPPort)
+	}
+	if c.Server.Port == c.Server.MetricsPort || c.Server.Port == c.Server.HTTPPort || c.Server.MetricsPort == c.Server.HTTPPort {
+		return fmt.Errorf("server, metrics, and http ports must be different")
 	}
 	if c.Database.ConnectionString == "" {
 		return fmt.Errorf("database connection string is required")

@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"sync"
 
+	"time"
+
 	"github.com/zenith/zenith/internal/api"
 	"github.com/zenith/zenith/internal/cache"
+	"github.com/zenith/zenith/internal/circuitbreaker"
 	"github.com/zenith/zenith/internal/db"
 	"github.com/zenith/zenith/internal/engine"
 	"github.com/zenith/zenith/internal/metrics"
@@ -17,7 +20,6 @@ import (
 	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"time"
 )
 
 // Service implements the Zenith gRPC service
@@ -26,9 +28,10 @@ type Service struct {
 	repo            *db.TupleRepo
 	expander        *engine.ExpansionEngine
 	reverseExpander *engine.ReverseExpansionEngine
-	cache           *cache.Cache // Optional cache
-	sfGroup         singleflight.Group // For request deduplication
-	sfMu            sync.Mutex         // Protects sfGroup (though singleflight is thread-safe)
+	cache           *cache.Cache                   // Optional cache
+	sfGroup         singleflight.Group             // For request deduplication
+	sfMu            sync.Mutex                     // Protects sfGroup (though singleflight is thread-safe)
+	circuitBreaker  *circuitbreaker.CircuitBreaker // Optional circuit breaker
 }
 
 // NewService creates a new Zenith service
@@ -49,6 +52,18 @@ func NewServiceWithCache(repo *db.TupleRepo, expander *engine.ExpansionEngine, c
 		expander:        expander,
 		reverseExpander: reverseExpander,
 		cache:           cache,
+	}
+}
+
+// NewServiceWithCircuitBreaker creates a new Zenith service with circuit breaker
+func NewServiceWithCircuitBreaker(repo *db.TupleRepo, expander *engine.ExpansionEngine, cache *cache.Cache, cb *circuitbreaker.CircuitBreaker) *Service {
+	reverseExpander := engine.NewReverseExpansionEngineWithCache(repo, cache, 10, 100)
+	return &Service{
+		repo:            repo,
+		expander:        expander,
+		reverseExpander: reverseExpander,
+		cache:           cache,
+		circuitBreaker:  cb,
 	}
 }
 
@@ -211,6 +226,16 @@ func (s *Service) Check(ctx context.Context, req *api.CheckRequest) (*api.CheckR
 		span.SetAttributes(attribute.String("check.required_zookie", fmt.Sprintf("%d", req.RequiredZookie)))
 	}
 
+	// Check circuit breaker if enabled
+	if s.circuitBreaker != nil {
+		if !s.circuitBreaker.Allow(ctx) {
+			// Circuit is open, use stale cache fallback
+			span.SetAttributes(attribute.String("circuit_breaker.state", "open"))
+			return s.checkStale(ctx, req, span)
+		}
+		span.SetAttributes(attribute.String("circuit_breaker.state", s.circuitBreaker.State().String()))
+	}
+
 	// Use singleflight to deduplicate concurrent identical requests
 	key := checkKey(req)
 	result, err, shared := s.sfGroup.Do(key, func() (interface{}, error) {
@@ -228,6 +253,10 @@ func (s *Service) Check(ctx context.Context, req *api.CheckRequest) (*api.CheckR
 		// Perform recursive check with userset expansion
 		allowed, zookie, err := s.expander.Check(ctx, checkReq)
 		if err != nil {
+			// Record failure in circuit breaker
+			if s.circuitBreaker != nil {
+				s.circuitBreaker.RecordFailure()
+			}
 			// Handle timeout gracefully (return false, not error)
 			if err.Error() == "check timeout exceeded" {
 				return &api.CheckResponse{
@@ -236,6 +265,11 @@ func (s *Service) Check(ctx context.Context, req *api.CheckRequest) (*api.CheckR
 				}, nil
 			}
 			return nil, err
+		}
+
+		// Record success in circuit breaker
+		if s.circuitBreaker != nil {
+			s.circuitBreaker.RecordSuccess()
 		}
 
 		return &api.CheckResponse{
@@ -256,7 +290,7 @@ func (s *Service) Check(ctx context.Context, req *api.CheckRequest) (*api.CheckR
 	}
 
 	resp := result.(*api.CheckResponse)
-	
+
 	// Add result to span
 	span.SetAttributes(
 		attribute.Bool("check.allowed", resp.Allowed),
@@ -272,6 +306,44 @@ func (s *Service) Check(ctx context.Context, req *api.CheckRequest) (*api.CheckR
 	}
 
 	return resp, nil
+}
+
+// checkStale performs a check using stale cache when circuit breaker is open
+// This bypasses zookie validation and uses cached results even if expired
+func (s *Service) checkStale(ctx context.Context, req *api.CheckRequest, span trace.Span) (*api.CheckResponse, error) {
+	span.SetAttributes(attribute.Bool("check.stale_mode", true))
+
+	// Try to get from cache without zookie validation
+	if s.cache != nil {
+		// Use a modified key that doesn't include zookie for stale lookups
+		staleKey := fmt.Sprintf("check:%s:%s:%s:%s:%s:%s",
+			req.SubjectNamespace,
+			req.SubjectId,
+			req.SubjectRelation,
+			req.Namespace,
+			req.ObjectId,
+			req.Relation,
+		)
+
+		// Try to get from cache (even if expired)
+		entry, ok := s.cache.GetCheckWithContext(ctx, staleKey)
+		if ok {
+			span.SetAttributes(attribute.Bool("check.stale_cache_hit", true))
+			metrics.RecordRequest("check", "stale_cache_hit")
+			return &api.CheckResponse{
+				Allowed: entry.Allowed,
+				Zookie:  entry.Zookie, // May be stale, but better than nothing
+			}, nil
+		}
+	}
+
+	// No cache available, return denied (safe default)
+	span.SetAttributes(attribute.Bool("check.stale_cache_miss", true))
+	metrics.RecordRequest("check", "stale_cache_miss")
+	return &api.CheckResponse{
+		Allowed: false,
+		Zookie:  0,
+	}, nil
 }
 
 // ListSubjects handles ListSubjects RPC requests
@@ -332,3 +404,226 @@ func (s *Service) ListSubjects(ctx context.Context, req *api.ListSubjectsRequest
 	}, nil
 }
 
+// BatchCheck handles BatchCheck RPC requests
+// Processes multiple permission checks in parallel (up to 30)
+func (s *Service) BatchCheck(ctx context.Context, req *api.BatchCheckRequest) (*api.BatchCheckResponse, error) {
+	start := time.Now()
+
+	// Create span for BatchCheck operation
+	ctx, span := observability.StartSpan(ctx, "BatchCheck",
+		trace.WithAttributes(
+			attribute.Int("batch.size", len(req.Requests)),
+		),
+	)
+	defer span.End()
+	defer func() {
+		duration := time.Since(start)
+		metrics.RecordRequestDuration("batch_check", duration)
+		metrics.RecordBatchCheckSize(len(req.Requests))
+	}()
+
+	// Validate request size (max 30 checks)
+	if len(req.Requests) == 0 {
+		span.RecordError(status.Error(codes.InvalidArgument, "at least one check request is required"))
+		metrics.RecordRequest("batch_check", "invalid_argument")
+		return nil, status.Error(codes.InvalidArgument, "at least one check request is required")
+	}
+	if len(req.Requests) > 30 {
+		span.RecordError(status.Error(codes.InvalidArgument, "maximum 30 checks allowed per batch"))
+		metrics.RecordRequest("batch_check", "invalid_argument")
+		return nil, status.Error(codes.InvalidArgument, "maximum 30 checks allowed per batch")
+	}
+
+	// Validate each request
+	for i, checkReq := range req.Requests {
+		if checkReq.Namespace == "" {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("request %d: namespace is required", i))
+		}
+		if checkReq.ObjectId == "" {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("request %d: object_id is required", i))
+		}
+		if checkReq.Relation == "" {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("request %d: relation is required", i))
+		}
+		if checkReq.SubjectNamespace == "" {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("request %d: subject_namespace is required", i))
+		}
+		if checkReq.SubjectId == "" {
+			return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("request %d: subject_id is required", i))
+		}
+	}
+
+	// Use required_zookie from batch request if provided, otherwise use individual request zookies
+	requiredZookie := req.RequiredZookie
+	if requiredZookie == 0 {
+		// If batch-level zookie not provided, use max from individual requests
+		for _, checkReq := range req.Requests {
+			if checkReq.RequiredZookie > requiredZookie {
+				requiredZookie = checkReq.RequiredZookie
+			}
+		}
+	}
+
+	if requiredZookie > 0 {
+		observability.AddZookieToSpan(span, requiredZookie)
+		span.SetAttributes(attribute.String("batch.required_zookie", fmt.Sprintf("%d", requiredZookie)))
+	}
+
+	// Process checks in parallel using goroutines
+	type checkResult struct {
+		index  int
+		result *api.CheckResult
+		err    error
+	}
+
+	resultChan := make(chan checkResult, len(req.Requests))
+	var wg sync.WaitGroup
+
+	// Launch goroutine for each check
+	for i, checkReq := range req.Requests {
+		wg.Add(1)
+		go func(idx int, cr *api.CheckRequest) {
+			defer wg.Done()
+
+			// Use individual required_zookie if batch-level not provided
+			checkZookie := requiredZookie
+			if checkZookie == 0 && cr.RequiredZookie > 0 {
+				checkZookie = cr.RequiredZookie
+			}
+
+			// Create a CheckRequest with the zookie
+			checkRequest := &api.CheckRequest{
+				SubjectNamespace: cr.SubjectNamespace,
+				SubjectId:        cr.SubjectId,
+				SubjectRelation:  cr.SubjectRelation,
+				Namespace:        cr.Namespace,
+				ObjectId:         cr.ObjectId,
+				Relation:         cr.Relation,
+				RequiredZookie:   checkZookie,
+			}
+
+			// Use singleflight to deduplicate identical checks within the batch
+			key := checkKey(checkRequest)
+			result, err, _ := s.sfGroup.Do(key, func() (interface{}, error) {
+				// Build check request for expansion engine
+				checkReq := &engine.CheckRequest{
+					SubjectNamespace: checkRequest.SubjectNamespace,
+					SubjectID:        checkRequest.SubjectId,
+					SubjectRelation:  checkRequest.SubjectRelation,
+					ObjectNamespace:  checkRequest.Namespace,
+					ObjectID:         checkRequest.ObjectId,
+					Relation:         checkRequest.Relation,
+					RequiredZookie:   checkRequest.RequiredZookie,
+				}
+
+				// Perform recursive check with userset expansion
+				allowed, zookie, err := s.expander.Check(ctx, checkReq)
+				if err != nil {
+					// Handle timeout gracefully (return false, not error)
+					if err.Error() == "check timeout exceeded" {
+						return &api.CheckResult{
+							Allowed: false,
+							Zookie:  0,
+						}, nil
+					}
+					return nil, err
+				}
+
+				return &api.CheckResult{
+					Allowed: allowed,
+					Zookie:  zookie,
+				}, nil
+			})
+
+			if err != nil {
+				resultChan <- checkResult{
+					index: idx,
+					err:   err,
+				}
+				return
+			}
+
+			resultChan <- checkResult{
+				index:  idx,
+				result: result.(*api.CheckResult),
+			}
+		}(i, checkReq)
+	}
+
+	// Close channel when all goroutines complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results (may arrive out of order)
+	results := make([]*api.CheckResult, len(req.Requests))
+	var maxZookie int64
+	var hasError bool
+	var firstError error
+
+	for res := range resultChan {
+		if res.err != nil {
+			hasError = true
+			if firstError == nil {
+				firstError = res.err
+			}
+			// For errors, return a denied result with zookie 0
+			results[res.index] = &api.CheckResult{
+				Allowed: false,
+				Zookie:  0,
+			}
+		} else {
+			results[res.index] = res.result
+			if res.result.Zookie > maxZookie {
+				maxZookie = res.result.Zookie
+			}
+		}
+	}
+
+	// If we got a zookie of 0 from all checks, get current zookie
+	if maxZookie == 0 {
+		zookie, err := s.repo.GetZookie(ctx)
+		if err != nil {
+			span.RecordError(err)
+			metrics.RecordRequest("batch_check", "error")
+			return nil, status.Error(codes.Internal, fmt.Sprintf("failed to get zookie: %v", err))
+		}
+		maxZookie = zookie
+	}
+
+	// Add result summary to span
+	allowedCount := 0
+	for _, res := range results {
+		if res != nil && res.Allowed {
+			allowedCount++
+		}
+	}
+	span.SetAttributes(
+		attribute.Int("batch.allowed_count", allowedCount),
+		attribute.Int("batch.denied_count", len(results)-allowedCount),
+	)
+	if maxZookie > 0 {
+		observability.AddZookieToSpan(span, maxZookie)
+	}
+
+	if hasError {
+		metrics.RecordRequest("batch_check", "partial_error")
+		// Return partial results with error (client can check individual results)
+		// For now, we'll return the results but log the error
+		span.RecordError(firstError)
+	} else {
+		metrics.RecordRequest("batch_check", "success")
+	}
+
+	return &api.BatchCheckResponse{
+		Results: results,
+		Zookie:  maxZookie,
+	}, nil
+}
+
+// ListAllTuples returns all tuples in the database
+// This is a helper method for the REST gateway to list all tuples
+func (s *Service) ListAllTuples(ctx context.Context) ([]*models.Tuple, error) {
+	return s.repo.ListAll(ctx)
+}

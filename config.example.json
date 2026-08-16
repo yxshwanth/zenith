@@ -2,6 +2,7 @@
   "server": {
     "port": 50051,
     "metrics_port": 9090,
+    "http_port": 8081,
     "reflection": true
   },
   "database": {

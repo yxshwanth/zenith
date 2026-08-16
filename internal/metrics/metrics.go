@@ -72,6 +72,68 @@ var (
 			Help: "Number of active database connections",
 		},
 	)
+
+	// Batch check metrics
+	BatchCheckSize = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "zenith_batch_check_size",
+			Help:    "Distribution of batch check sizes (number of checks per batch)",
+			Buckets: []float64{1, 5, 10, 15, 20, 25, 30},
+		},
+	)
+
+	// SLO metrics
+	SLOCheckLatencyP99 = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "zenith_slo_check_latency_p99_seconds",
+			Help: "99th percentile latency for check operations in seconds",
+		},
+	)
+
+	SLOErrorBudgetRemaining = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "zenith_slo_error_budget_remaining_percent",
+			Help: "Remaining error budget percentage",
+		},
+	)
+
+	SLOAvailabilityPercentage = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "zenith_slo_availability_percentage",
+			Help: "Service availability percentage",
+		},
+	)
+
+	SLOCacheHitRate = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "zenith_slo_cache_hit_rate_percent",
+			Help: "Cache hit rate percentage",
+		},
+	)
+
+	CircuitBreakerState = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "zenith_circuit_breaker_state",
+			Help: "Circuit breaker state (0=closed, 1=open, 2=half_open)",
+		},
+		[]string{"operation"},
+	)
+
+	CircuitBreakerFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "zenith_circuit_breaker_failures_total",
+			Help: "Total number of circuit breaker failures",
+		},
+		[]string{"operation"},
+	)
+
+	StaleCacheServed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "zenith_stale_cache_served_total",
+			Help: "Total number of stale cache entries served",
+		},
+		[]string{"operation"},
+	)
 )
 
 // RecordRequest records a request with operation type and status
@@ -107,5 +169,45 @@ func RecordDatabaseQuery(operation string, duration time.Duration) {
 // SetActiveConnections sets the number of active database connections
 func SetActiveConnections(count float64) {
 	ActiveConnections.Set(count)
+}
+
+// RecordBatchCheckSize records the size of a batch check operation
+func RecordBatchCheckSize(size int) {
+	BatchCheckSize.Observe(float64(size))
+}
+
+// SetSLOCheckLatencyP99 sets the 99th percentile latency for check operations
+func SetSLOCheckLatencyP99(seconds float64) {
+	SLOCheckLatencyP99.Set(seconds)
+}
+
+// SetSLOErrorBudgetRemaining sets the remaining error budget percentage
+func SetSLOErrorBudgetRemaining(percent float64) {
+	SLOErrorBudgetRemaining.Set(percent)
+}
+
+// SetSLOAvailabilityPercentage sets the availability percentage
+func SetSLOAvailabilityPercentage(percent float64) {
+	SLOAvailabilityPercentage.Set(percent)
+}
+
+// SetSLOCacheHitRate sets the cache hit rate percentage
+func SetSLOCacheHitRate(percent float64) {
+	SLOCacheHitRate.Set(percent)
+}
+
+// SetCircuitBreakerState sets the circuit breaker state
+func SetCircuitBreakerState(operation string, state float64) {
+	CircuitBreakerState.WithLabelValues(operation).Set(state)
+}
+
+// RecordCircuitBreakerFailure records a circuit breaker failure
+func RecordCircuitBreakerFailure(operation string) {
+	CircuitBreakerFailures.WithLabelValues(operation).Inc()
+}
+
+// RecordStaleCacheServed records a stale cache entry being served
+func RecordStaleCacheServed(operation string) {
+	StaleCacheServed.WithLabelValues(operation).Inc()
 }
 

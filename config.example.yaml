@@ -1,6 +1,7 @@
 server:
   port: 50051
   metrics_port: 9090
+  http_port: 8081  # HTTP gateway port (8080 is used by CockroachDB Admin UI)
   reflection: true
 
 database:

@@ -16,6 +16,7 @@ import (
 	"github.com/zenith/zenith/internal/config"
 	"github.com/zenith/zenith/internal/db"
 	"github.com/zenith/zenith/internal/engine"
+	"github.com/zenith/zenith/internal/gateway"
 	_ "github.com/zenith/zenith/internal/metrics" // Initialize metrics
 	"github.com/zenith/zenith/internal/middleware"
 	"github.com/zenith/zenith/internal/observability"
@@ -44,6 +45,7 @@ var (
 	enableTracing     = flag.String("enable-tracing", "", "Enable OpenTelemetry tracing (overrides config: true/false)")
 	tracingEndpoint   = flag.String("tracing-endpoint", "", "OTel collector endpoint (overrides config)")
 	metricsPort       = flag.Int("metrics-port", -1, "HTTP port for Prometheus metrics (overrides config, -1 means use config)")
+	httpPort          = flag.Int("http-port", -1, "HTTP gateway port (overrides config, -1 means use config)")
 )
 
 func main() {
@@ -91,6 +93,9 @@ func main() {
 	}
 	if *metricsPort >= 0 {
 		cfg.Server.MetricsPort = *metricsPort
+	}
+	if *httpPort >= 0 {
+		cfg.Server.HTTPPort = *httpPort
 	}
 
 	// Validate final configuration
@@ -235,15 +240,24 @@ func main() {
 		Handler: metricsMux,
 	}
 	go func() {
-		log.Printf("Starting metrics server on port %d...", *metricsPort)
+		log.Printf("Starting metrics server on port %d...", cfg.Server.MetricsPort)
 		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("Failed to start metrics server: %v", err)
 		}
 	}()
 
-	// Start server in a goroutine
+	// Start HTTP gateway server
+	httpGateway := gateway.NewGateway(zenithService)
 	go func() {
-		log.Printf("Starting gRPC server on port %d...", *port)
+		log.Printf("Starting HTTP gateway on port %d...", cfg.Server.HTTPPort)
+		if err := httpGateway.Start(cfg.Server.HTTPPort); err != nil {
+			log.Printf("Failed to start HTTP gateway: %v", err)
+		}
+	}()
+
+	// Start gRPC server in a goroutine
+	go func() {
+		log.Printf("Starting gRPC server on port %d...", cfg.Server.Port)
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatalf("Failed to serve: %v", err)
 		}
@@ -263,6 +277,11 @@ func main() {
 	// Shutdown metrics server
 	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Error shutting down metrics server: %v", err)
+	}
+
+	// Shutdown HTTP gateway
+	if err := httpGateway.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Error shutting down HTTP gateway: %v", err)
 	}
 
 	// Stop accepting new connections
