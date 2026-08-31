@@ -1,5 +1,5 @@
-// Package sim implements the deterministic simulation harness (UPDATE.md,
-// Section 13): a single-threaded event scheduler that drives real
+// Package sim implements the deterministic simulation harness
+// (docs/adr/0005-deterministic-core-contract.md): a single-threaded event scheduler that drives real
 // runtime.Core implementations through virtual time, plus independently
 // seeded PRNG streams so that one master seed reproduces an identical run
 // byte-for-byte.
@@ -10,8 +10,7 @@ import "math/bits"
 // stream is a deterministic PRNG independently seeded from a master seed
 // and a stable name (SplitMix64). Streams derived from the same master
 // seed never share state, so adding random draws to one subsystem does not
-// perturb another subsystem's sequence (UPDATE.md, Section 13: "Separating
-// streams reduces accidental scenario drift").
+// perturb another subsystem's sequence.
 type stream struct {
 	state uint64
 }

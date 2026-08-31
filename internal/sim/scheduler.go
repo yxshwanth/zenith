@@ -3,7 +3,7 @@ package sim
 import (
 	"container/heap"
 
-	"github.com/zenith/zenith/internal/runtime"
+	"github.com/yxshwanth/zenith/internal/runtime"
 )
 
 // VirtualTime is the simulation's own clock: a count of scheduler ticks,
@@ -15,8 +15,7 @@ type VirtualTime int64
 // from the scheduler's own PRNG stream at schedule time, so events due at
 // the same VirtualTime are ordered deterministically for a given seed,
 // while a different seed can explore a different, equally valid delivery
-// order — the "two alternative delivery orders" a replay needs to compare
-// (UPDATE.md, Section 18, task 3).
+// order — the two alternative delivery orders a replay needs to compare.
 type scheduledEvent struct {
 	due      VirtualTime
 	tiebreak uint64
@@ -137,3 +136,8 @@ func (s *Scheduler) Run(maxSteps int) []Delivery {
 
 // Trace returns the delivery order produced so far.
 func (s *Scheduler) Trace() []Delivery { return s.trace }
+
+// Register adds or replaces a core for target (membership / learners).
+func (s *Scheduler) Register(target runtime.NodeID, core runtime.Core) {
+	s.cores[target] = core
+}

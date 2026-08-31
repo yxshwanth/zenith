@@ -6,6 +6,8 @@
 *.dylib
 zenith
 zenith-server
+/server
+/bin/
 
 # Test binary, built with `go test -c`
 *.test
@@ -40,4 +42,10 @@ go.work
 
 # Logs
 *.log
+
+# Local planning docs (not committed)
+UPDATE.md
+docs/UPDATE.md
+docs/PHASES.md
+docs/contracts.md
 

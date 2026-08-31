@@ -1,5 +1,5 @@
 // Package checker implements independent reference models used to validate
-// the real Zenith implementation and simulator (UPDATE.md, Section 14). A
+// the real Zenith implementation and simulator (docs/invariants.md). A
 // checker must never call the production MVCC visibility routine, cache,
 // or evaluator it is meant to validate — this package has no dependency on
 // any other internal/* package, deliberately.
@@ -39,7 +39,7 @@ type KVResult struct {
 // implementation of a key/value store. It exists purely as an oracle: the
 // real replicated store's externally observed behavior must match applying
 // the same operations, in some legal order, to this model
-// (UPDATE.md, Section 14, "Porcupine models and histories").
+// (docs/invariants.md, Porcupine models and histories).
 type KVModel struct {
 	data map[string]string
 }

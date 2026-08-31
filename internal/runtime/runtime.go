@@ -1,6 +1,6 @@
 // Package runtime defines the deterministic event/effect contract shared by
-// the real Zenith node adapters and the simulator (UPDATE.md, Section 4
-// "Deterministic core contract" and Section 13). A Core implementation may
+// the real Zenith node adapters and the simulator (docs/adr/0005-deterministic-core-contract.md).
+// A Core implementation may
 // only observe the world through Step; it must not perform I/O, block,
 // read the wall clock, or use ambient randomness.
 package runtime

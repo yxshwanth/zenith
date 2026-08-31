@@ -3,8 +3,7 @@ package runtime
 // Effect is a side effect a Core has requested. The adapter is responsible
 // for carrying it out and feeding any resulting completion back in as an
 // Event; returning an Effect is not evidence that it happened
-// (UPDATE.md, Section 4: "A 'Ready' batch is not permission to perform
-// every listed effect in arbitrary order").
+// (docs/adr/0005-deterministic-core-contract.md).
 type Effect interface {
 	effect()
 }
@@ -34,6 +33,7 @@ type Send struct {
 // Schedule asks the adapter to fire a ScheduledWork event after Delay,
 // expressed in the runtime's own logical units (ticks or virtual
 // duration) — never as a wall-clock deadline.
+// Reserved; raft.Node never returns this effect.
 type Schedule struct {
 	RequestID string
 	Delay     int64

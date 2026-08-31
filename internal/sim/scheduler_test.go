@@ -1,11 +1,31 @@
 package sim
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"reflect"
 	"testing"
 
-	"github.com/zenith/zenith/internal/runtime"
+	"github.com/yxshwanth/zenith/internal/runtime"
 )
+
+// hashTrace is the Phase 0 gate fingerprint: same seed → same hex digest.
+func hashTrace(trace []Delivery) string {
+	h := sha256.New()
+	for _, d := range trace {
+		fmt.Fprintf(h, "%d|%d|%T|", d.Due, d.Target, d.Event)
+		switch e := d.Event.(type) {
+		case runtime.Tick:
+			fmt.Fprintf(h, "%s\n", e.Kind)
+		case runtime.PeerMessage:
+			fmt.Fprintf(h, "%d|%s\n", e.From, e.Payload)
+		default:
+			fmt.Fprintf(h, "%v\n", e)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // pingCore is a minimal toy Core used only to exercise the scheduler's
 // determinism guarantees. It is not part of the Raft implementation: on a
@@ -49,8 +69,7 @@ func runToyScenario(seed uint64) []Delivery {
 	return s.Run(100)
 }
 
-// TestSchedulerDeterministicReplay is the Phase 0 completion gate from
-// UPDATE.md Section 18: "Identical build/seed gives identical trace."
+// TestSchedulerDeterministicReplay: identical build/seed gives identical trace.
 func TestSchedulerDeterministicReplay(t *testing.T) {
 	for seed := uint64(0); seed < 20; seed++ {
 		first := runToyScenario(seed)
@@ -79,6 +98,58 @@ func TestSchedulerExploresAlternativeOrders(t *testing.T) {
 	if len(orders) < 2 {
 		t.Fatalf("expected the tiebreak stream to produce more than one delivery order across seeds, got %v", orders)
 	}
+}
+
+// TestTwoSeedsDifferentOrdersEachReplayable is Phase 0 task 0.7:
+// same Schedule set, two seeds → different valid orders; each seed stable.
+func TestTwoSeedsDifferentOrdersEachReplayable(t *testing.T) {
+	var seedA, seedB uint64
+	var orderA, orderB string
+	found := false
+	for a := uint64(0); a < 40 && !found; a++ {
+		for b := a + 1; b < 40; b++ {
+			oa := peerOrder(runToyScenario(a))
+			ob := peerOrder(runToyScenario(b))
+			if oa != ob {
+				seedA, seedB, orderA, orderB = a, b, oa, ob
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatal("could not find two seeds with different peer delivery orders")
+	}
+	if peerOrder(runToyScenario(seedA)) != orderA {
+		t.Fatalf("seed %d not replayable", seedA)
+	}
+	if peerOrder(runToyScenario(seedB)) != orderB {
+		t.Fatalf("seed %d not replayable", seedB)
+	}
+}
+
+func peerOrder(trace []Delivery) string {
+	var order string
+	for _, d := range trace {
+		if d.Target == 2 || d.Target == 3 {
+			order += string(rune('0' + d.Target))
+		}
+	}
+	return order
+}
+
+// TestSmokeTraceHashIdentical is the Phase 0 completion gate (task 0.9):
+// fixed seed → identical SHA-256 of the delivery trace across two runs.
+//
+//	go test ./internal/sim -run TestSmokeTraceHashIdentical -count=2
+func TestSmokeTraceHashIdentical(t *testing.T) {
+	const seed = 42
+	h1 := hashTrace(runToyScenario(seed))
+	h2 := hashTrace(runToyScenario(seed))
+	if h1 != h2 {
+		t.Fatalf("identical seed produced different hashes:\n%s\n%s", h1, h2)
+	}
+	t.Logf("smoke trace hash (seed=%d): %s", seed, h1)
 }
 
 // TestSchedulerDeliversBothMessages is a basic sanity check that the toy

@@ -3,13 +3,66 @@ package checker
 // HistoryEntry records one client-observed KV operation: the operation
 // itself, its recorded result, and its invocation/completion order in the
 // simulator's global event order (never per-node wall-clock time —
-// UPDATE.md, Section 14, "Record client-observed invocation and
-// completion in global simulation event order, not skewed node clocks").
+// docs/invariants.md).
 type HistoryEntry struct {
 	Op          KVOp
 	Result      KVResult
 	InvokedAt   int64
 	CompletedAt int64
+	// Unknown is true when the client never observed a completion (timeout
+	// / lost reply). Such entries must not be treated as a Pass on their
+	// own — see CheckKVHistory.
+	Unknown bool
+}
+
+// CheckOutcome is the three-way result required by docs/invariants.md:
+// Pass / Fail / Inconclusive are reported separately. A timeout is never a Pass.
+type CheckOutcome int
+
+const (
+	Pass CheckOutcome = iota
+	Fail
+	Inconclusive
+)
+
+func (o CheckOutcome) String() string {
+	switch o {
+	case Pass:
+		return "pass"
+	case Fail:
+		return "fail"
+	case Inconclusive:
+		return "inconclusive"
+	default:
+		return "unknown"
+	}
+}
+
+// CheckKVHistory classifies a history. Any Unknown entry makes the result
+// Inconclusive unless the resolved subset is already illegal (Fail).
+// Completed-only illegal histories Fail; fully resolved legal histories Pass.
+func CheckKVHistory(history []HistoryEntry) CheckOutcome {
+	var resolved []HistoryEntry
+	hasUnknown := false
+	for _, e := range history {
+		if e.Unknown {
+			hasUnknown = true
+			continue
+		}
+		resolved = append(resolved, e)
+	}
+	if len(resolved) > 0 {
+		if CheckKVPorcupine(resolved) == Fail {
+			return Fail
+		}
+	}
+	if hasUnknown {
+		return Inconclusive
+	}
+	if len(resolved) == 0 {
+		return Pass // empty history
+	}
+	return Pass
 }
 
 // LinearizableKV reports whether history has at least one total order,
@@ -18,10 +71,8 @@ type HistoryEntry struct {
 // recorded result. On success it also returns a witnessing order (indexes
 // into history).
 //
-// This is a brute-force checker intended only for the small histories
-// Phase 0 produces (UPDATE.md, Section 14: "Keep those histories
-// intentionally small"); it is a placeholder for Porcupine integration,
-// not a replacement for it — see docs/invariants.md.
+// Small-history unit tests use this brute-force search. CheckKVHistory
+// classifies sim traces with CheckKVPorcupine (see docs/invariants.md).
 func LinearizableKV(history []HistoryEntry) (bool, []int) {
 	used := make([]bool, len(history))
 	return search(history, used, nil)
