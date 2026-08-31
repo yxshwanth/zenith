@@ -4,8 +4,8 @@
 *.dll
 *.so
 *.dylib
-zenith
-zenith-server
+/zenith
+/zenith-server
 /server
 /bin/
 
@@ -28,8 +28,7 @@ go.work
 *.swo
 *~
 
-# Generated protobuf files
-*.pb.go
+# Generated protobuf files (keep api/zenith/v2/pb committed for CI)
 *.pb.gw.go
 
 # Environment files
