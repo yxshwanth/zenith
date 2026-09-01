@@ -99,13 +99,15 @@ type Node struct {
 	timeoutTicks  int
 	tickCount     int
 
-	snapIndex   uint64
-	snapTerm    uint64
-	snapData    []byte
-	pendingSnap []byte
-	cfg         Config
-	bootstrap   []runtime.NodeID // initial voters for truncate rebuild
-	jointIndex  uint64           // log index of active joint entry; 0 if none
+	snapIndex     uint64
+	snapTerm      uint64
+	snapData      []byte
+	pendingSnap   []byte
+	cfg           Config
+	bootstrap     []runtime.NodeID // initial voters for truncate rebuild
+	jointIndex    uint64           // log index of active joint entry; 0 if none
+	commitAnyTerm bool             // test-only: skip Raft §5.4.2 current-term check
+	holdFinalize  bool             // test-only: keep C_old,new live (no auto ProposeFinalize)
 }
 
 // New returns a follower with empty log and a dummy entry at index 0.
@@ -127,6 +129,21 @@ func New(id runtime.NodeID, peers []runtime.NodeID) *Node {
 	}
 	return n
 }
+
+// SetElectionTimeout sets the follower campaign threshold in ticks.
+func (n *Node) SetElectionTimeout(ticks int) {
+	if ticks < 1 {
+		ticks = 1
+	}
+	n.timeoutTicks = ticks
+}
+
+// SetCommitAnyTerm enables the broken commit rule (previous-term entries
+// become committed without a current-term entry). Production stays false.
+func (n *Node) SetCommitAnyTerm(broken bool) { n.commitAnyTerm = broken }
+
+// SetHoldFinalize keeps joint consensus from auto-finalizing (G1 crash tests).
+func (n *Node) SetHoldFinalize(v bool) { n.holdFinalize = v }
 
 func (n *Node) lastIndex() uint64 { return n.log[len(n.log)-1].Index }
 func (n *Node) lastTerm() uint64  { return n.log[len(n.log)-1].Term }
@@ -524,7 +541,10 @@ func (n *Node) onAppendEntriesResp(m peerMsg) []runtime.Effect {
 func (n *Node) maybeCommit() []runtime.Effect {
 	for N := n.lastIndex(); N > n.commitIndex; N-- {
 		e, ok := n.entry(N)
-		if !ok || e.Term != n.currentTerm {
+		if !ok {
+			continue
+		}
+		if !n.commitAnyTerm && e.Term != n.currentTerm {
 			continue
 		}
 		if n.quorumCommitted(N) {
@@ -553,7 +573,7 @@ func (n *Node) applyCommitted() []runtime.Effect {
 			}
 		}
 	}
-	if n.role == Leader && n.jointIndex > 0 && n.commitIndex >= n.jointIndex && len(n.cfg.JointWith) > 0 {
+	if !n.holdFinalize && n.role == Leader && n.jointIndex > 0 && n.commitIndex >= n.jointIndex && len(n.cfg.JointWith) > 0 {
 		out = append(out, n.ProposeFinalize()...)
 	}
 	return out
@@ -618,7 +638,7 @@ func (n *Node) persistThen(then []runtime.Effect) []runtime.Effect {
 	b, _ := json.Marshal(hs)
 	n.persistID = fmt.Sprintf("p-%d-%d", n.ID, n.tickCount)
 	n.syncInFlight = true
-	n.afterSync = then
+	n.afterSync = append(n.afterSync, then...)
 	return []runtime.Effect{
 		runtime.Persist{RequestID: n.persistID, Data: b},
 		runtime.Sync{RequestID: n.persistID},
@@ -630,7 +650,7 @@ func (n *Node) onDisk(d runtime.DiskCompletion) []runtime.Effect {
 		return nil
 	}
 	if d.Err != nil || !d.Synced {
-		return nil
+		return []runtime.Effect{runtime.Sync{RequestID: n.persistID}}
 	}
 	n.syncInFlight = false
 	out := n.afterSync
@@ -760,3 +780,10 @@ func (n *Node) SetSnapData(data []byte) {
 
 // LogLen returns number of retained entries excluding the snap placeholder.
 func (n *Node) LogLen() int { return len(n.log) - 1 }
+
+// LogEntries returns a copy of the retained log including the snap placeholder.
+func (n *Node) LogEntries() []Entry {
+	out := make([]Entry, len(n.log))
+	copy(out, n.log)
+	return out
+}

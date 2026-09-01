@@ -19,6 +19,8 @@ jobs:
         run: make test-v2
       - name: sim-smoke
         run: make sim-smoke
+      - name: regression corpus
+        run: make sim-corpus
       - name: race (raft/replica/wal)
         run: make test-race-v2
       - name: zenith-sim elect-put

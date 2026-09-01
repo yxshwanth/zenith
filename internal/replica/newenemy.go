@@ -2,6 +2,7 @@ package replica
 
 import (
 	"fmt"
+	"sort"
 
 	v2 "github.com/yxshwanth/zenith/api/zenith/v2"
 	contentservice "github.com/yxshwanth/zenith/examples/content-service"
@@ -12,7 +13,19 @@ import (
 
 // RunNewEnemy is the A3 adversary: revoke, fence, publish, then reject a stale check.
 func RunNewEnemy(seed uint64) error {
-	c := NewCluster(seed, []runtime.NodeID{1, 2, 3})
+	return runNewEnemy(NewCluster(seed, []runtime.NodeID{1, 2, 3}), false)
+}
+
+// RunNewEnemyExplore is A3 under seeded net/election faults; which replica lags
+// is drawn from the workload stream, not a fixed map walk.
+func RunNewEnemyExplore(seed uint64) error {
+	c := NewClusterWithFaults(seed, []runtime.NodeID{1, 2, 3}, Faults{
+		MaxNetDelay: 2, DropPermille: 10, ElectJitter: 4,
+	})
+	return runNewEnemy(c, true)
+}
+
+func runNewEnemy(c *Cluster, seededLag bool) error {
 	leader := c.BootstrapElect(50)
 	if leader == 0 {
 		return fmt.Errorf("no leader")
@@ -34,6 +47,16 @@ func RunNewEnemy(seed uint64) error {
 		SubjectNamespace: "user", SubjectID: "bob", Delete: true,
 	})
 	c.Run(1500)
+	c.Faults = Faults{}
+	c.Run(400)
+	if c.Leader() == 0 {
+		leader = c.BootstrapElect(40)
+		if leader == 0 {
+			return fmt.Errorf("no leader after faults")
+		}
+	} else {
+		leader = c.Leader()
+	}
 	revR := uint64(c.Replicas[leader].MVCC.Applied())
 	if mvcc.Revision(revR) <= preRevoke {
 		return fmt.Errorf("revoke did not advance applied: before=%d after=%d", preRevoke, revR)
@@ -78,13 +101,7 @@ func RunNewEnemy(seed uint64) error {
 		return fmt.Errorf("expected error: cannot satisfy token with older exact revision")
 	}
 
-	var lag runtime.NodeID
-	for id := range c.Replicas {
-		if id != leader {
-			lag = id
-			break
-		}
-	}
+	lag := pickLag(c, leader, seededLag)
 	lagApplied := c.Replicas[lag].MVCC.Applied()
 	c.Frozen[lag] = true
 	c.ProposeTuple(leader, "bump", command{
@@ -131,4 +148,21 @@ func RunNewEnemy(seed uint64) error {
 		return fmt.Errorf("content serve must reject stale eval")
 	}
 	return nil
+}
+
+func pickLag(c *Cluster, leader runtime.NodeID, seeded bool) runtime.NodeID {
+	var others []runtime.NodeID
+	for id := range c.Replicas {
+		if id != leader {
+			others = append(others, id)
+		}
+	}
+	sort.Slice(others, func(i, j int) bool { return others[i] < others[j] })
+	if len(others) == 0 {
+		return leader
+	}
+	if seeded {
+		return others[c.Sched.WorkloadIntn(len(others))]
+	}
+	return others[0]
 }

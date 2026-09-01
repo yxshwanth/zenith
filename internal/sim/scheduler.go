@@ -88,6 +88,11 @@ func NewScheduler(masterSeed uint64, cores map[runtime.NodeID]runtime.Core, hand
 	}
 }
 
+func (s *Scheduler) NetworkIntn(n int) int  { return s.streams.Network.Intn(n) }
+func (s *Scheduler) DiskIntn(n int) int     { return s.streams.Disk.Intn(n) }
+func (s *Scheduler) ElectionIntn(n int) int { return s.streams.Election.Intn(n) }
+func (s *Scheduler) WorkloadIntn(n int) int { return s.streams.Workload.Intn(n) }
+
 // Now returns the scheduler's current virtual time.
 func (s *Scheduler) Now() VirtualTime { return s.now }
 

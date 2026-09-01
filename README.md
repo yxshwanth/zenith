@@ -1,6 +1,6 @@
 # Zenith
 
-**Zenith v2** is a replicated authorization database with a custom Raft core, MVCC snapshot reads, deterministic fault simulation, and a content-version protocol to prevent the new-enemy problem.
+**Zenith v2** is a replicated authorization database with a custom Raft core, MVCC snapshot reads, a deterministic replay harness (seeded explorer faults are opt-in), and a content-version protocol to prevent the new-enemy problem.
 
 This is an experimental systems project. It is **not** a production replacement for OpenFGA, SpiceDB, CockroachDB, or Google Zanzibar. Correctness claims require reproducible evidence under `make test-v2` / `make sim-smoke`.
 

@@ -31,11 +31,20 @@ ID; the adapter — real or simulated — is responsible for feeding the
 matching completion back in as an Event.
 
 The simulator (`internal/sim`) drives `Core` implementations through a
-single-threaded, seeded event scheduler. All randomness used for workload
-choice, network faults, disk faults, election timing, and scheduling
-tie-breaks is drawn from independently named PRNG streams derived from one
-master seed, so that adding draws to one subsystem cannot perturb another
-subsystem's sequence (`UPDATE.md`, Section 13, "Scheduler").
+single-threaded, seeded event scheduler. Independently named PRNG streams
+are derived from one master seed so that adding draws to one subsystem
+cannot perturb another subsystem's sequence (`UPDATE.md`, Section 13,
+"Scheduler").
+
+**Covered:** the scheduler stream is drawn at every `Schedule` for
+same-due-time tie-breaks. **Partial:** named streams `Workload`, `Network`,
+`Disk`, and `Election` exist and are consumed by `internal/replica` when
+`Faults` rates are non-zero (`NewClusterWithFaults`, profile `explore`).
+Zero-value `Faults` still draws those streams (drop/fail rolls miss, delay
+stays 1) so turning rates on later does not reshuffle another stream.
+Scripted profiles (`elect-put`, `crash-matrix`) keep rates at zero; their
+`--seed` only changes tie-breaks, not the lockstep net/disk/election
+timeouts. That is the replay half of the machine, not a randomized explorer.
 
 ## Consequences
 

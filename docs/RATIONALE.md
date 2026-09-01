@@ -160,14 +160,17 @@ make test-v2          # unit/integration across runtime, sim, checker, raft, wal
                       # coordinator, deccache, nodehost, examples/content-service
 make sim-smoke        # scheduler determinism (count=2), elect/put + crash + new-enemy,
                       # zenith-sim elect-put seed 42
+make sim-sweep        # ZENITH_SWEEP=1000 explore seeds (not default CI)
+make sim-corpus       # testdata/regressions replay + zenith-sim replay
 make test-race-v2     # -race on raft, replica, wal
 make cluster-up       # N real zenithd processes, elect, HTTP put/get (loopback --dev)
 go run ./cmd/zenith-sim run --seed 42 --profile elect-put
 go run ./cmd/zenith-sim run --seed 44 --profile new-enemy
+go run ./cmd/zenith-sim run --seed 42 --profile explore
 go run ./cmd/zenith-sim replay --trace testdata/regressions/<file>.json
 ```
 
-CI (`.github/workflows/v2.yml`): `gofmt -l` empty, `make test-v2`, `make sim-smoke`, `make test-race-v2`, elect-put, a timed `zenithd --dev` smoke.
+CI (`.github/workflows/v2.yml`): `gofmt -l` empty, `make test-v2`, `make sim-smoke`, `make sim-corpus`, `make test-race-v2`, elect-put, a timed `zenithd --dev` smoke.
 
 Identical build + seed must produce an identical scheduler trace (`TestSchedulerDeterministicReplay`, `TestSmokeTraceHashIdentical`). That is a **measurement**, not a slogan.
 
@@ -176,21 +179,22 @@ Identical build + seed must produce an identical scheduler trace (`TestScheduler
 | Can measure today | How | Status |
 | --- | --- | --- |
 | ≤1 leader per term (R1) | `TestR1AtMostOneLeaderPerTerm` | Covered |
-| Vote durability before grant (R2) | `TestR2VotePersistsBeforeGrantVisible` | Covered |
-| Log prefix agreement (R3) | `checker.PrefixLedger` fixture | Partial |
+| Vote durability before grant (R2) | `TestVoteGrantWithheldAcrossFailedSyncStorm`; no leader if every fsync fails | Covered |
+| Session retry does not double-apply (D2) | `TestSessionUnknownRetryThenDigestMismatch` | Covered |
+| New-enemy (A3) | `TestNewEnemyExploreSeeds`; `new-enemy-explore` profile | Covered |
+| Joint quorum (G1) | `TestJointLiveCrashDualQuorum`; dual-quorum block | Covered |
+| Commit current-term only (Raft §5.4.2) | `TestMaybeCommitRefusesPreviousTermWithoutCurrentTermEntry`; broken hook + Porcupine fixture | Covered |
+| Log prefix agreement (R3) | `TestLogMatchingLeaderChangeMidAppend` | Covered |
 | Apply only committed prefix (R4, R5) | apply path / `lastApplied` vs `commitIndex` | Partial / covered |
 | Acked mutation survives crash (D1) | crash-matrix replica tests | Covered |
-| Session retry does not double-apply (D2) | `TestSessionRetryNoDup` | Covered |
-| Snapshot install does not regress prefix (D3) | atomic publish; older snap rejected; InstallSnapshot send on compact | Partial |
+| Snapshot install does not regress prefix (D3) | `TestCrashDuringInstallSnapshotKeepsPrefix`; older snap rejected | Covered |
 | MVCC visible-at-r matches oracle (M1) | `TestMVCCMatchesVersionOracle` | Covered |
 | One query, one revision (M2) | authz `revSeen` | Covered |
 | GC refuses to mutate under a pin (M3) | `TestGCRefusesPinned`; replica `TestGCAfterApplyKeepsCheck` | Covered |
 | Check = graph oracle (A1) | `TestAuthzMatchesGraphOracle` | Covered |
 | Missing evidence ≠ ALLOW (A2) | budget + closed snap | Covered |
-| New-enemy (A3) | `TestNewEnemyStaleReplicaBlocked`, `zenith-sim --profile new-enemy` | Covered |
 | Batch same snapshot (A4) | `TestBatchCheckSameRevision` | Covered |
 | Cache respects revision (C1) | `TestDecisionCacheRespectsRevision` | Covered |
-| Joint quorum (G1) | learner non-quorum + dual-quorum block | Covered |
 | Progress after heal (L1) | partition heal tests | Covered |
 
 **Pass / fail / inconclusive are three outcomes.** A timeout is never recorded as pass. Porcupine classifies completed KV histories (`CheckKVHistory` → `CheckKVPorcupine`). Unknown ops in the history make the result inconclusive unless the resolved subset is already illegal (fail).
@@ -206,7 +210,7 @@ Identical build + seed must produce an identical scheduler trace (`TestScheduler
 - Dataset-larger-than-memory behavior.
 - `zenith-sim shrink` was removed; traces are type-name dumps, not replayable Event lists. Replay is seed + profile.
 - Index hit-rate / Leopard comparison: package deleted until a differential checker exists.
-- Bug ledger in `docs/bugs/` is template only; no filed simulator discoveries at the time of writing. Do not invent bugs to look rigorous.
+- Bug ledger in `docs/bugs/` is template only; no filed simulator discoveries at the time of writing. `make sim-sweep` (1000 hot explore seeds) is the search, not a proof of absence. Do not invent bugs to look rigorous.
 
 ### Operational counters the code could grow into metrics
 
@@ -216,13 +220,44 @@ Quorum availability, leadership changes, WAL sync failures, commit/apply lag, sn
 
 ## 7. Fault model (what “tested” means)
 
-**Supported faults:** delayed, dropped, duplicated, reordered, asymmetrically partitioned messages; crash/restart; pauses; delayed disk I/O; failed writes/syncs; crash-torn unsynced writes; wall-clock jumps (**liveness only**).
+Convention matches [invariants.md](invariants.md): **Covered** is what the
+code does today. **Building toward** is the design, not a result.
 
-**Assumptions:** peers are not Byzantine; a successful `fsync` matches the model; unsynced data may vanish, survive, or partially persist.
+### Covered
 
-**Safety vs liveness:** a partition that never heals is allowed to stall. Tests that inject unbounded chaos without a healthy suffix do not get to conclude “liveness failed.” TigerBeetle’s split (fault-heavy safety, then a recovery phase) is the intended pattern ([T7](https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness/)).
+| Fault | How |
+| --- | --- |
+| Same-due reordering | Scheduler PRNG tie-break on every `Schedule` |
+| Manual drop | `Partition` (undirected), `DropDir` (asymmetric), `Frozen` |
+| Crash / restart | `Crash` + WAL `CrashUnsynced` (torn unsynced suffix) |
+| Scripted crash order | `crash-matrix` crashes nodes 1, 2, 3 in that order |
+| Seeded net delay / drop / duplicate | `Faults.MaxNetDelay`, `DropPermille`, `DupPermille` (profile `explore`) |
+| Seeded disk delay / failed fsync | `Faults.MaxDiskDelay`, `SyncFailPermille`; `onDisk` retries `Sync` |
+| Election jitter | `Faults.ElectJitter` on timeout ticks |
+| Workload choice | `ExplorePuts` draws keys/values from the workload stream |
+| Healthy suffix | explore zeros `Faults` and drains before judging history |
 
-**Real vs sim:** the simulator does not replace disk-full, kernel, or NIC behavior. `internal/nodehost` tests cover WAL append failure (panic), MVCC order panic, and snapshot install restore. `make cluster-up` is a real multi-process elect/put/get. That is the current real-adapter evidence, thin compared to the sim matrix, and labeled as such.
+Zero-value `Faults` (elect-put, most unit tests): streams are drawn but
+rolls miss, delay is 1, fsync succeeds, timeouts stay `3+3*id`. `--seed 42`
+and `--seed 44` on `elect-put` are not two different executions.
+
+### Building toward
+
+Delayed/duplicated/reordered messages and failed syncs as the **default**
+for every profile; a recorded fault schedule (not only Bernoulli rolls);
+wall-clock jumps (liveness only); CI over seeds 1..N with Porcupine as the
+judge; a `docs/bugs/` entry with a reproducing seed. Unbounded chaos
+without a healthy suffix still must not be scored as a liveness failure
+(TigerBeetle split, [T7](https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness/)).
+
+**Assumptions:** peers are not Byzantine; a successful `fsync` matches the
+model; unsynced data may vanish, survive, or partially persist.
+
+**Real vs sim:** the simulator does not replace disk-full, kernel, or NIC
+behavior. `internal/nodehost` tests cover WAL append failure (panic), MVCC
+order panic, and snapshot install restore. `make cluster-up` is a real
+multi-process elect/put/get. That is the current real-adapter evidence,
+thin compared to the sim matrix, and labeled as such.
 
 ---
 
