@@ -1,19 +1,21 @@
 package checker
 
-// PrefixLedger checks R3-style: same (index,term) implies equal command digests.
-type PrefixLedger map[uint64]struct {
-	Term uint64
-	Hash string
+// prefixKey is (index, term). R3: same pair implies the same command.
+// Different terms at one index are log overwrite, not a conflict.
+type prefixKey struct {
+	Index uint64
+	Term  uint64
 }
 
+// PrefixLedger checks R3: same (index, term) implies equal command hashes.
+type PrefixLedger map[prefixKey]string
+
 func (p PrefixLedger) Observe(index, term uint64, hash string) bool {
-	prev, ok := p[index]
+	k := prefixKey{Index: index, Term: term}
+	prev, ok := p[k]
 	if !ok {
-		p[index] = struct {
-			Term uint64
-			Hash string
-		}{Term: term, Hash: hash}
+		p[k] = hash
 		return true
 	}
-	return prev.Term == term && prev.Hash == hash
+	return prev == hash
 }

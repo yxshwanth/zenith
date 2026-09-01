@@ -34,14 +34,15 @@ func usage() {
 type traceFile struct {
 	Seed    uint64   `json:"seed"`
 	Profile string   `json:"profile"`
-	Assert  string   `json:"assert"` // "leader" | "put"
+	Expect  string   `json:"expect,omitempty"`
+	Assert  string   `json:"assert,omitempty"`
 	Events  []string `json:"events,omitempty"`
 }
 
 func runCmd(args []string) {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	seed := fs.Uint64("seed", 42, "master seed")
-	profile := fs.String("profile", "elect-put", "elect-put|crash-matrix|new-enemy")
+	profile := fs.String("profile", "elect-put", "elect-put|crash-matrix|new-enemy|new-enemy-explore|explore")
 	outTrace := fs.String("out-trace", "", "optional path to write scheduler event kinds")
 	_ = fs.Parse(args)
 	ok, events := runProfile(*seed, *profile)
@@ -62,6 +63,17 @@ func runProfile(seed uint64, profile string) (bool, []string) {
 		}
 		fmt.Printf("ok profile=new-enemy seed=%d\n", seed)
 		return true, nil
+	}
+	if profile == "new-enemy-explore" {
+		if err := replica.RunNewEnemyExplore(seed); err != nil {
+			fmt.Println("FAIL", err)
+			return false, nil
+		}
+		fmt.Printf("ok profile=new-enemy-explore seed=%d\n", seed)
+		return true, nil
+	}
+	if profile == "explore" {
+		return runExplore(seed)
 	}
 	c := replica.NewCluster(seed, []runtime.NodeID{1, 2, 3})
 	leader := c.BootstrapElect(50)
@@ -96,6 +108,30 @@ func runProfile(seed uint64, profile string) (bool, []string) {
 	return true, eventKinds(c)
 }
 
+func runExplore(seed uint64) (bool, []string) {
+	c := replica.NewClusterWithFaults(seed, []runtime.NodeID{1, 2, 3}, replica.Faults{
+		MaxNetDelay: 3, DropPermille: 20, DupPermille: 10,
+		MaxDiskDelay: 2, SyncFailPermille: 40, ElectJitter: 6,
+	})
+	if c.BootstrapElect(80) == 0 {
+		fmt.Println("FAIL no leader")
+		return false, eventKinds(c)
+	}
+	c.ExplorePuts(4)
+	c.Faults = replica.Faults{}
+	if c.Leader() == 0 {
+		c.BootstrapElect(80)
+	}
+	c.Run(800)
+	out := c.CheckHistory()
+	if out.String() == "fail" {
+		fmt.Println("FAIL history", out)
+		return false, eventKinds(c)
+	}
+	fmt.Printf("ok profile=explore seed=%d leader=%d history=%s\n", seed, c.Leader(), out)
+	return true, eventKinds(c)
+}
+
 func eventKinds(c *replica.Cluster) []string {
 	var out []string
 	for _, d := range c.Sched.Trace() {
@@ -123,6 +159,14 @@ func replayCmd(args []string) {
 		os.Exit(1)
 	}
 	ok, _ := runProfile(meta.Seed, meta.Profile)
+	wantFail := meta.Expect == "fail"
+	if wantFail {
+		if ok {
+			fmt.Println("FAIL expected fail")
+			os.Exit(1)
+		}
+		return
+	}
 	if !ok {
 		os.Exit(1)
 	}

@@ -157,7 +157,19 @@ func (h *Host) onApply(a runtime.Apply) {
 	case "Put":
 		key, _ := cmd["key"].(string)
 		val, _ := cmd["value"].(string)
-		h.KV[key] = val
+		sess, _ := cmd["session"].(string)
+		if sess != "" {
+			seq := uint64(num(cmd["seq"]))
+			dig, _ := cmd["digest"].(string)
+			if cached, _, err := h.Sessions.Decide(sess, seq, dig); err != nil || cached != nil {
+				h.MVCC.SetApplied(mvcc.Revision(a.Index))
+				return
+			}
+			h.KV[key] = val
+			h.Sessions.Put(sess, seq, dig, []byte("ok"), a.Index)
+		} else {
+			h.KV[key] = val
+		}
 		h.MVCC.SetApplied(mvcc.Revision(a.Index))
 	case "Fence", "Noop":
 		h.MVCC.SetApplied(mvcc.Revision(a.Index))
@@ -229,6 +241,9 @@ func (h *Host) drainPendingSnap() {
 	if h.KV == nil {
 		h.KV = map[string]string{}
 	}
+	if len(st.Sessions) > 0 {
+		_ = json.Unmarshal(st.Sessions, &h.Sessions)
+	}
 }
 
 func (h *Host) sendPeer(to runtime.NodeID, payload []byte) {
@@ -287,12 +302,13 @@ func (h *Host) Propose(reqID string, payload []byte, wait time.Duration) error {
 func (h *Host) Check(store, ons, oid, rel, sns, sid string) (bool, string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// Fence via noop put of applied watermark for strong read when leader.
-	rev := h.MVCC.Applied()
-	if rev == 0 {
-		rev = mvcc.Revision(h.Node.LastApplied())
-		h.MVCC.SetApplied(rev)
+	if idx, ok := h.Node.ReadIndex(); ok {
+		h.MVCC.SetApplied(mvcc.Revision(idx))
 	}
+	if h.MVCC.Applied() < mvcc.Revision(h.Node.LastApplied()) {
+		h.MVCC.SetApplied(mvcc.Revision(h.Node.LastApplied()))
+	}
+	rev := h.MVCC.Applied()
 	if rev == 0 {
 		return false, "", fmt.Errorf("no revision")
 	}

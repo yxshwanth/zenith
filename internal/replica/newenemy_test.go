@@ -9,3 +9,11 @@ func TestNewEnemyStaleReplicaBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNewEnemyExploreSeeds(t *testing.T) {
+	for _, seed := range []uint64{7, 19, 44, 91} {
+		if err := RunNewEnemyExplore(seed); err != nil {
+			t.Fatalf("seed %d: %v", seed, err)
+		}
+	}
+}

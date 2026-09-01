@@ -18,3 +18,13 @@ func TestPorcupineAgreesOnLegalIllegal(t *testing.T) {
 		t.Fatal("illegal should fail")
 	}
 }
+
+func TestPorcupineRejectsCommittedThenOverwrittenValue(t *testing.T) {
+	hist := []HistoryEntry{
+		{Op: KVOp{Kind: KVPut, Key: "x", Value: "old"}, Result: KVResult{Found: true, Value: "old"}, InvokedAt: 0, CompletedAt: 10},
+		{Op: KVOp{Kind: KVGet, Key: "x"}, Result: KVResult{Found: true, Value: "new"}, InvokedAt: 20, CompletedAt: 30},
+	}
+	if CheckKVPorcupine(hist) != Fail {
+		t.Fatal("acked prev-term put then get of overwrite must fail")
+	}
+}

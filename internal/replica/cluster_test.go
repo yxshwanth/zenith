@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/yxshwanth/zenith/internal/checker"
+	"github.com/yxshwanth/zenith/internal/raft"
 	"github.com/yxshwanth/zenith/internal/runtime"
 )
 
@@ -138,5 +139,40 @@ func TestStrongGetFence(t *testing.T) {
 	v, ok := c.StrongGet(leader, "fence1", "g")
 	if !ok || v != "1" {
 		t.Fatalf("got %q %v", v, ok)
+	}
+}
+
+func TestStrongGetStaleLeaderUnknown(t *testing.T) {
+	c := NewCluster(12, []runtime.NodeID{1, 2, 3})
+	old := c.BootstrapElect(40)
+	if old == 0 {
+		t.Fatal("no leader")
+	}
+	c.ProposePut(old, "p1", "s", 1, "k", "v5")
+	c.Run(1000)
+	for _, p := range []runtime.NodeID{1, 2, 3} {
+		if p != old {
+			c.Partition(old, p)
+		}
+	}
+	var neu runtime.NodeID
+	for i := 0; i < 80 && neu == 0; i++ {
+		c.TickElection()
+		c.Run(200)
+		for id, r := range c.Replicas {
+			if id != old && r.Node.Role() == raft.Leader {
+				neu = id
+				break
+			}
+		}
+	}
+	if neu == 0 {
+		t.Fatal("no new leader")
+	}
+	c.ProposePut(neu, "p2", "s", 2, "k", "v3")
+	c.Run(1000)
+	v, ok := c.StrongGet(old, "stale-fence", "k")
+	if ok {
+		t.Fatalf("stale leader must not complete get, got %q", v)
 	}
 }

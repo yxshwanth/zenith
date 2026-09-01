@@ -38,31 +38,12 @@ func (o CheckOutcome) String() string {
 	}
 }
 
-// CheckKVHistory classifies a history. Any Unknown entry makes the result
-// Inconclusive unless the resolved subset is already illegal (Fail).
-// Completed-only illegal histories Fail; fully resolved legal histories Pass.
+// CheckKVHistory classifies a history. Unknown entries are incomplete ops,
+// not dropped: stripping them makes a later Get of an unacked Put look like
+// a phantom read. Outcome is Fail only if Porcupine still rejects after
+// treating unknown Puts as unbounded. Otherwise Unknown yields Inconclusive.
 func CheckKVHistory(history []HistoryEntry) CheckOutcome {
-	var resolved []HistoryEntry
-	hasUnknown := false
-	for _, e := range history {
-		if e.Unknown {
-			hasUnknown = true
-			continue
-		}
-		resolved = append(resolved, e)
-	}
-	if len(resolved) > 0 {
-		if CheckKVPorcupine(resolved) == Fail {
-			return Fail
-		}
-	}
-	if hasUnknown {
-		return Inconclusive
-	}
-	if len(resolved) == 0 {
-		return Pass // empty history
-	}
-	return Pass
+	return CheckKVPorcupine(history)
 }
 
 // LinearizableKV reports whether history has at least one total order,

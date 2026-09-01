@@ -36,6 +36,37 @@ func TestStartElectionPersists(t *testing.T) {
 	t.Fatalf("expected Persist on single-voter election, last=%#v", effs)
 }
 
+func TestFailedSyncRetriesThenReleasesAfterSync(t *testing.T) {
+	n := New(1, []runtime.NodeID{1})
+	var persistID string
+	for i := 0; i < n.timeoutTicks+2; i++ {
+		effs := n.Step(runtime.Tick{Kind: "election"})
+		for _, e := range effs {
+			if s, ok := e.(runtime.Sync); ok {
+				persistID = s.RequestID
+			}
+		}
+		if persistID != "" {
+			break
+		}
+	}
+	if persistID == "" {
+		t.Fatal("expected Sync from single-voter election")
+	}
+	retry := n.Step(runtime.DiskCompletion{RequestID: persistID, Synced: false})
+	if len(retry) != 1 {
+		t.Fatalf("want 1 Sync retry, got %#v", retry)
+	}
+	s, ok := retry[0].(runtime.Sync)
+	if !ok || s.RequestID != persistID {
+		t.Fatalf("want Sync %s, got %#v", persistID, retry)
+	}
+	after := n.Step(runtime.DiskCompletion{RequestID: persistID, Synced: true})
+	if len(after) == 0 {
+		t.Fatal("expected afterSync effects once fsync succeeds")
+	}
+}
+
 func TestSendAppendInstallsSnapshotWhenCompacted(t *testing.T) {
 	n := New(1, []runtime.NodeID{1, 2, 3})
 	n.role = Leader

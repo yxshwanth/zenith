@@ -158,4 +158,13 @@ func TestCheckKVHistoryPassFailInconclusive(t *testing.T) {
 	if got := CheckKVHistory(unknownPlusLegal); got != Inconclusive {
 		t.Fatalf("unknown+legal: want inconclusive, got %s", got)
 	}
+
+	// Unacked Put of k=v1 then completed Get of k=v1 is legal (Inconclusive).
+	inflightExplainsGet := []HistoryEntry{
+		{Op: KVOp{Kind: KVPut, Key: "k0", Value: "v1"}, InvokedAt: 33, Unknown: true},
+		{Op: KVOp{Kind: KVGet, Key: "k0"}, Result: KVResult{Found: true, Value: "v1"}, InvokedAt: 40, CompletedAt: 41},
+	}
+	if got := CheckKVHistory(inflightExplainsGet); got != Inconclusive {
+		t.Fatalf("inflight put explains get: want inconclusive, got %s", got)
+	}
 }
