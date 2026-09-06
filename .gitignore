@@ -48,3 +48,7 @@ docs/UPDATE.md
 docs/PHASES.md
 docs/contracts.md
 
+
+# Local editor/agent config, not part of the project
+.cursorrules
+.cursor/
